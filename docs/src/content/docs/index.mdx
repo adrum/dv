@@ -1,0 +1,107 @@
+---
+title: Every .NET SDK your projects need, side by side
+description: dv installs Microsoft's official .NET SDKs and resolves the right one per directory — through global.json, the file .NET already reads.
+template: splash
+banner:
+  content: 'dv is pre-release: until 1.0, commands and file formats may still change between versions.'
+hero:
+  tagline: One binary. Any .NET SDK Microsoft publishes, verified before it is unpacked. The right one in every directory — including the ones your editor and your CI runner open.
+  actions:
+    - text: Get started
+      link: guides/getting-started/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/adrum/dv
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, Aside, Steps } from '@astrojs/starlight/components';
+
+```sh
+dv install 10.0         # newest 10.0 SDK, from Microsoft
+dv install 8            # newest 8.x
+cd ~/code/legacy && dv pin 8.0
+dotnet --version        # 8.0.426
+cd ~/code/new && dotnet --version   # 10.0.402
+```
+
+## The problem is not installing .NET once
+
+It is keeping several SDKs on one machine *and* controlling which one each
+project gets.
+
+.NET is built to install side by side, but the system-wide installers put
+everything in one place that needs admin rights to change, and the `dotnet`
+host only ever listens to `global.json`. There is no "default", no override
+for one command, and installing a preview to try it quietly moves every
+unpinned project onto it.
+
+dv keeps every SDK under one directory you own and decides which one runs —
+and it decides the way `dotnet` itself would.
+
+<CardGrid>
+  <Card title="Microsoft's own SDKs" icon="seti:c-sharp">
+    Nothing is rebuilt. dv reads Microsoft's release metadata and installs the
+    archive published for your machine, so every SDK, preview and old patch
+    Microsoft ships is available the day it ships — no dv update needed.
+  </Card>
+  <Card title="global.json, read exactly" icon="document">
+    No new version file. `dv pin` writes `global.json`, and dv applies
+    `rollForward` with the same rules as the `dotnet` host's resolver —
+    ported from its source, not its documentation.
+  </Card>
+  <Card title="Right outside your terminal too" icon="approve-check">
+    Resolution runs through real files on `PATH`, not a shell hook. Editors,
+    language servers, CI runners and git hooks inherit `PATH` and nothing
+    else — a hook never fires for them. dv's shims do not have that problem.
+  </Card>
+  <Card title="Verified, or not installed" icon="seti:lock">
+    Every archive is checked against the sha512 Microsoft publishes before it
+    is unpacked, and verification fails closed: a missing or malformed hash is
+    an error, never a reason to skip the check.
+  </Card>
+</CardGrid>
+
+## What a version switch costs
+
+<Steps>
+
+1. **Install once per SDK.** `dv install 10.0` fetches one archive and
+   unpacks it. Nothing is compiled, so it takes about as long as the
+   download.
+
+2. **Pin per project.** `dv pin 10.0` writes `global.json`, which you
+   commit. Everyone on the project — and Visual Studio, Rider and CI — gets
+   the same SDK.
+
+3. **Switch by changing directory.** No shell reload, no daemon, no `use`
+   command. `cd`, and `dotnet` is a different SDK.
+
+</Steps>
+
+## Every runtime, for every SDK
+
+An app built for `net8.0` needs the 8.0 runtime even when SDK 10 builds it.
+dv runs each SDK from an install root that holds **that SDK and every
+installed runtime**, so a project multi-targeting `net8.0;net10.0` builds,
+tests and runs on both — with no extra installs and no NuGet downloads of
+targeting packs. The roots are hard links, so they cost no extra disk. See
+[how dv runs an SDK](/dv/reference/install-roots/).
+
+## What dv is not
+
+**It does not replace NuGet, or `dotnet tool`.** dv is the SDK half: getting
+the right SDKs onto the machine and pointing `dotnet` at the right one.
+Packages, local tools and global tools work exactly as they always do.
+
+**It does not touch a system-wide .NET.** dv never writes outside its own
+directory, needs no admin rights, and leaves `/usr/local/share/dotnet` or
+`C:\Program Files\dotnet` alone. `dv doctor` tells you when one of those is
+shadowing dv on `PATH`.
+
+<Aside type="note" title="Where it runs">
+macOS, Linux (glibc and musl) and Windows, on x64 and Arm64 — anywhere
+Microsoft publishes an SDK. The client is a single Rust binary with no
+runtime dependencies. See [platforms](/dv/reference/platforms/).
+</Aside>
