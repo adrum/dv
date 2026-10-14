@@ -1,10 +1,13 @@
 //! Where dv keeps its state on disk.
 //!
-//! Everything lives under one root (`DV_HOME`, default `~/.dv`) so that
-//! uninstalling dv is `rm -rf` of a single directory:
+//! Everything lives under one root so that uninstalling dv is `rm -rf` of a
+//! single directory. `DV_HOME` names it; otherwise it is `dv` in the XDG data
+//! directory (`$XDG_DATA_HOME`, else `~/.local/share`), where fnm, uv and rv
+//! keep their toolchains too — or `%LOCALAPPDATA%\dv` on Windows, which has
+//! no XDG:
 //!
 //! ```text
-//! ~/.dv/
+//! ~/.local/share/dv/
 //!   versions/<sdk>/      extracted SDK archives, exactly as published
 //!   roots/<sdk>/         one install root per SDK: that SDK, every runtime
 //!   dotnet/              one install root holding everything (DOTNET_ROOT)
@@ -26,7 +29,31 @@ pub fn home() -> Result<PathBuf> {
         }
         return Ok(dir);
     }
-    Ok(user_home()?.join(".dv"))
+    data_home().map(|dir| dir.join("dv"))
+}
+
+/// Where per-user application data belongs on this platform.
+#[cfg(not(windows))]
+fn data_home() -> Result<PathBuf> {
+    // The spec says a relative XDG_DATA_HOME is invalid and must be ignored.
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from)
+        && dir.is_absolute()
+    {
+        return Ok(dir);
+    }
+    Ok(user_home()?.join(".local").join("share"))
+}
+
+/// Where per-user application data belongs on this platform. Local rather
+/// than roaming: SDKs are hundreds of megabytes of machine-specific binaries.
+#[cfg(windows)]
+fn data_home() -> Result<PathBuf> {
+    if let Some(dir) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+        && dir.is_absolute()
+    {
+        return Ok(dir);
+    }
+    Ok(user_home()?.join("AppData").join("Local"))
 }
 
 /// The user's home directory.

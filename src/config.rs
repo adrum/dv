@@ -1,4 +1,4 @@
-//! `~/.dv/config.toml` — user preferences, plain text and hand-editable.
+//! `config.toml` in dv's home — user preferences, plain text and hand-editable.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};

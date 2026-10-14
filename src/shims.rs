@@ -401,17 +401,17 @@ mod tests {
 
     #[test]
     fn init_snippets_are_idempotent_prepend_and_set_dotnet_root() {
-        let shims = Path::new("/home/dev/.dv/shims");
-        let combined = Path::new("/home/dev/.dv/dotnet");
+        let shims = Path::new("/home/dev/.local/share/dv/shims");
+        let combined = Path::new("/home/dev/.local/share/dv/dotnet");
 
         let posix = init_snippet("zsh", shims, combined);
         assert!(posix.contains("case \":$PATH:\""), "idempotent: {posix}");
         assert!(
-            posix.contains("PATH=\"/home/dev/.dv/shims:$PATH\""),
+            posix.contains("PATH=\"/home/dev/.local/share/dv/shims:$PATH\""),
             "prepends: {posix}"
         );
         assert!(
-            posix.contains("DOTNET_ROOT=\"/home/dev/.dv/dotnet\""),
+            posix.contains("DOTNET_ROOT=\"/home/dev/.local/share/dv/dotnet\""),
             "{posix}"
         );
 
@@ -435,9 +435,9 @@ mod tests {
         let fish = init_snippet("fish", shims, combined);
         assert!(fish.contains("if not contains"), "idempotent: {fish}");
         assert!(
-            fish.contains("set -gx PATH '/home/dev/.dv/shims' $PATH"),
+            fish.contains("set -gx PATH '/home/dev/.local/share/dv/shims' $PATH"),
             "prepends: {fish}"
         );
-        assert!(fish.contains("set -gx DOTNET_ROOT '/home/dev/.dv/dotnet'"));
+        assert!(fish.contains("set -gx DOTNET_ROOT '/home/dev/.local/share/dv/dotnet'"));
     }
 }
