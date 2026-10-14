@@ -1,0 +1,120 @@
+name: release
+
+# Cut a dv release: build the client for every platform and publish the
+# archives. `dv self update` and install.sh both read the unversioned
+# `dv-<rid>.tar.gz` and its `.sha256` sidecar through the latest-release
+# redirect, so there is no manifest to maintain.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build and publish'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: osx-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - rid: osx-x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          # musl keeps the Linux client a genuinely dependency-free binary, so
+          # one build serves glibc and musl distributions alike. It is
+          # published under both names, since dv asks for the one matching
+          # the machine it runs on.
+          - rid: linux-x64
+            also: linux-musl-x64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - rid: linux-arm64
+            also: linux-musl-arm64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+          # The gnu target links against nothing but DLLs Windows ships, so
+          # dv.exe stays a single file with no runtime to install beside it.
+          - rid: win-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-gnu
+            exe: .exe
+          - rid: win-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            exe: .exe
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+
+      - if: contains(matrix.target, 'linux-musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - run: cargo test --release --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          shasum() { if command -v shasum >/dev/null 2>&1; then command shasum "$@"; else shift 2; sha256sum "$@"; fi; }
+          python="$(command -v python3 || command -v python)"
+          version="$(cargo metadata --no-deps --format-version 1 | "$python" -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+          root="dv-${version}-${{ matrix.rid }}"
+          # One top-level directory holding bin/, because dv self update
+          # extracts with the first component stripped.
+          mkdir -p "stage/${root}/bin"
+          cp "target/${{ matrix.target }}/release/dv${{ matrix.exe }}" "stage/${root}/bin/dv${{ matrix.exe }}"
+          mkdir -p dist
+          tar -czf "dist/${root}.tar.gz" -C stage "${root}"
+          (cd dist && shasum -a 256 "${root}.tar.gz" > "${root}.tar.gz.sha256")
+          # Unversioned copies, so install.sh and self update can fetch through
+          # the releases/latest redirect without discovering the version first.
+          for rid in ${{ matrix.rid }} ${{ matrix.also }}; do
+            cp "dist/${root}.tar.gz" "dist/dv-${rid}.tar.gz"
+            (cd dist && shasum -a 256 "dv-${rid}.tar.gz" > "dv-${rid}.tar.gz.sha256")
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dv-${{ matrix.rid }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: incoming
+      - run: |
+          mkdir -p dist
+          find incoming -type f -exec cp {} dist/ \;
+          ls -l dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          for asset in dist/*; do
+            gh release upload "$TAG" "$asset" --clobber
+          done
