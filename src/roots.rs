@@ -74,6 +74,7 @@ pub fn sync(refreshed: &[Version]) -> Result<()> {
     let installed = installs::installed()?;
     let _lock = crate::lock::acquire(&paths::home()?, "roots", "updating install roots")?;
 
+    let versions = paths::versions_dir()?;
     let mut entries = Vec::new();
     for version in &installed {
         entries.extend(entries_of(version)?);
@@ -81,7 +82,7 @@ pub fn sync(refreshed: &[Version]) -> Result<()> {
 
     for version in &installed {
         let desired = desired_for(&entries, Some(version));
-        sync_root(&installs::root(version)?, &desired, refreshed)?;
+        sync_root(&versions, &installs::root(version)?, &desired, refreshed)?;
     }
     remove_stale_roots(&installed)?;
 
@@ -89,7 +90,12 @@ pub fn sync(refreshed: &[Version]) -> Result<()> {
     if installed.is_empty() {
         remove_root(&combined)?;
     } else {
-        sync_root(&combined, &desired_for(&entries, None), refreshed)?;
+        sync_root(
+            &versions,
+            &combined,
+            &desired_for(&entries, None),
+            refreshed,
+        )?;
     }
     Ok(())
 }
@@ -180,6 +186,7 @@ fn desired_for(entries: &[Entry], only: Option<&Version>) -> BTreeMap<String, Ve
 }
 
 fn sync_root(
+    versions: &Path,
     root: &Path,
     desired: &BTreeMap<String, Version>,
     refreshed: &[Version],
@@ -199,7 +206,10 @@ fn sync_root(
             wanted.to_string() == owner && !refreshed.iter().any(|r| r == wanted)
         });
         if !keep {
-            remove_path(&root.join(&relative))?;
+            unlink_entry(
+                &versions.join(&owner).join(&relative),
+                &root.join(&relative),
+            )?;
             prune_empty_parents(root, &relative);
             record.entries.remove(&relative);
             write_record(root, &record)?;
@@ -211,11 +221,16 @@ fn sync_root(
         if record.entries.contains_key(relative) && target.exists() {
             continue;
         }
-        let source = paths::version_dir(&owner.to_string())?.join(relative);
-        // A path dv wants but has no record of can only be left over from an
-        // interrupted sync of the same content, so it is replaced.
-        remove_path(&target)?;
-        link_tree(&source, &target)?;
+        let source = versions.join(owner.to_string()).join(relative);
+        if target.is_dir() && source.is_dir() {
+            // Something is already here: what is left of an entry after its
+            // own files were removed — a workload's manifests, say — or an
+            // interrupted sync. Merge into it rather than replacing it.
+            link_dir(&source, &target)?;
+        } else {
+            remove_path(&target)?;
+            link_tree(&source, &target)?;
+        }
         record.entries.insert(relative.clone(), owner.to_string());
         write_record(root, &record)?;
     }
@@ -270,6 +285,9 @@ fn link_dir(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn link_file(source: &Path, target: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(target).is_ok() {
+        remove_path(target)?;
+    }
     if std::fs::hard_link(source, target).is_ok() {
         return Ok(());
     }
@@ -278,6 +296,29 @@ fn link_file(source: &Path, target: &Path) -> Result<()> {
     std::fs::copy(source, target)
         .map(|_| ())
         .with_context(|| format!("could not link or copy {}", source.display()))
+}
+
+/// Remove an entry dv placed, and only what dv placed in it.
+///
+/// The SDK writes into its install root: `dotnet workload update` adds new
+/// manifest versions inside `sdk-manifests/<band>/<manifest>/`, a directory
+/// dv linked. Removing the entry wholesale would take those with it, so only
+/// the paths the SDK itself shipped — `shipped` — are removed, and the
+/// directories they leave empty. When the SDK that shipped them is gone, so
+/// is any way to tell, and the entry goes whole.
+fn unlink_entry(shipped: &Path, target: &Path) -> Result<()> {
+    if !shipped.is_dir() {
+        return remove_path(target);
+    }
+    let Ok(entries) = std::fs::read_dir(shipped) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        unlink_entry(&entry.path(), &target.join(entry.file_name()))?;
+    }
+    // Not empty means something else lives here, which is the point.
+    let _ = std::fs::remove_dir(target);
+    Ok(())
 }
 
 fn remove_stale_roots(installed: &[Version]) -> Result<()> {
@@ -495,9 +536,46 @@ mod tests {
         write_record(&root, &record).unwrap();
 
         // Desired is empty: the recorded entry goes, the workload stays.
-        sync_root(&root, &BTreeMap::new(), &[]).unwrap();
+        sync_root(&dir.path().join("versions"), &root, &BTreeMap::new(), &[]).unwrap();
         assert!(!root.join("sdk/9.0.105").exists());
         assert!(workload.join("pack.txt").is_file());
         assert!(read_record(&root).unwrap().entries.is_empty());
+    }
+
+    #[test]
+    fn a_workload_update_inside_a_linked_entry_survives_relinking() {
+        let dir = tempfile::tempdir().unwrap();
+        let versions = dir.path().join("versions");
+        let entry = "sdk-manifests/8.0.100/microsoft.net.sdk.android";
+        let shipped = versions.join("8.0.426").join(entry);
+        std::fs::create_dir_all(&shipped).unwrap();
+        std::fs::write(shipped.join("WorkloadManifest.json"), b"shipped").unwrap();
+
+        let root = dir.path().join("root");
+        let mut desired = BTreeMap::new();
+        desired.insert(entry.to_string(), v("8.0.426"));
+        sync_root(&versions, &root, &desired, &[]).unwrap();
+
+        // `dotnet workload update` adds a side-by-side manifest version.
+        let update = root.join(entry).join("34.0.154");
+        std::fs::create_dir_all(&update).unwrap();
+        std::fs::write(update.join("WorkloadManifest.json"), b"updated").unwrap();
+
+        // A forced reinstall relinks the entry from the fresh tree.
+        std::fs::write(shipped.join("WorkloadManifest.json"), b"reinstalled").unwrap();
+        sync_root(&versions, &root, &desired, &[v("8.0.426")]).unwrap();
+        assert_eq!(
+            std::fs::read(root.join(entry).join("WorkloadManifest.json")).unwrap(),
+            b"reinstalled"
+        );
+        assert_eq!(
+            std::fs::read(update.join("WorkloadManifest.json")).unwrap(),
+            b"updated"
+        );
+
+        // Dropping the entry entirely still keeps what dv did not ship.
+        sync_root(&versions, &root, &BTreeMap::new(), &[]).unwrap();
+        assert!(!root.join(entry).join("WorkloadManifest.json").exists());
+        assert!(update.join("WorkloadManifest.json").is_file());
     }
 }
