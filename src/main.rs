@@ -446,7 +446,18 @@ fn cmd_list_remote(
 
     let mut available: Vec<(releases::Sdk, &releases::Channel)> = Vec::new();
     for channel in &channels {
-        for sdk in releases::fetch_channel(channel)? {
+        // One channel whose metadata cannot be read should not hide every
+        // other channel from a version picker. Installing stays strict: a
+        // wrong answer there is worse than an error.
+        let sdks = match releases::fetch_channel(channel) {
+            Ok(sdks) => sdks,
+            Err(err) if exit::code_for(&err) != exit::NETWORK => {
+                eprintln!("dv: skipping the {} channel: {err:#}", channel.version);
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
+        for sdk in sdks {
             if sdk.archive_for(&rid).is_some() {
                 available.push((sdk, channel));
             }

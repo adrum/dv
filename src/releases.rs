@@ -72,11 +72,13 @@ impl Channel {
 /// One downloadable file of one SDK.
 #[derive(Debug, Clone, Deserialize)]
 pub struct File {
+    #[serde(default, deserialize_with = "null_as_default")]
     pub name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub rid: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     pub url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub hash: String,
 }
 
@@ -146,7 +148,7 @@ impl Sdk {
 
 #[derive(Debug, Deserialize)]
 struct ChannelReleases {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     releases: Vec<Release>,
 }
 
@@ -156,7 +158,7 @@ struct Release {
     release_date: Option<String>,
     #[serde(default)]
     sdk: Option<RawSdk>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     sdks: Vec<RawSdk>,
 }
 
@@ -165,8 +167,21 @@ struct RawSdk {
     version: String,
     #[serde(rename = "runtime-version", default)]
     runtime_version: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     files: Vec<File>,
+}
+
+/// Read `null` as the field's default.
+///
+/// Microsoft's older metadata writes `null` where newer files omit a field —
+/// `"sdks": null` throughout 3.0, `"rid": null` on some 2.1 and 2.2 files —
+/// and `#[serde(default)]` alone covers only the missing case.
+fn null_as_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 pub fn fetch_index(url: &str) -> Result<Index> {
@@ -325,6 +340,25 @@ mod tests {
                 .ends_with(".zip")
         );
         assert!(newest.archive_for("linux-x64").is_none());
+    }
+
+    #[test]
+    fn nulls_in_older_metadata_read_as_absent() {
+        // The shapes .NET Core 2.1, 2.2 and 3.0 metadata actually contain.
+        let body = format!(
+            r#"{{"releases":[
+              {{"release-date":null,"sdks":null,"sdk":{{"version":"3.0.100-preview6-012264","files":[
+                {{"name":"dotnet-sdk-osx-x64.tar.gz","rid":"osx-x64","url":"https://example.test/a.tar.gz","hash":"{a}"}},
+                {{"name":"dotnet-sdk.zip","rid":null,"url":"https://example.test/b.zip","hash":null}}
+              ]}}}},
+              {{"sdk":{{"version":"3.0.103","files":null}}}}
+            ]}}"#,
+            a = hash('a'),
+        );
+        let sdks = parse_channel("3.0", &body).unwrap();
+        assert_eq!(sdks.len(), 2);
+        assert!(sdks[0].archive_for("osx-x64").is_some());
+        assert!(sdks[1].files.is_empty());
     }
 
     #[test]
