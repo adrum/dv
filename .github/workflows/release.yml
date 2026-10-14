@@ -71,7 +71,10 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          shasum() { if command -v shasum >/dev/null 2>&1; then command shasum "$@"; else shift 2; sha256sum "$@"; fi; }
+          # Windows runners have sha256sum but no shasum. A distinct name, not
+          # a `shasum` wrapper: `command -v shasum` would find the wrapper
+          # itself and never fall back.
+          sha256() { if command -v shasum >/dev/null 2>&1; then shasum -a 256 "$@"; else sha256sum "$@"; fi; }
           python="$(command -v python3 || command -v python)"
           version="$(cargo metadata --no-deps --format-version 1 | "$python" -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
           root="dv-${version}-${{ matrix.rid }}"
@@ -81,12 +84,12 @@ jobs:
           cp "target/${{ matrix.target }}/release/dv${{ matrix.exe }}" "stage/${root}/bin/dv${{ matrix.exe }}"
           mkdir -p dist
           tar -czf "dist/${root}.tar.gz" -C stage "${root}"
-          (cd dist && shasum -a 256 "${root}.tar.gz" > "${root}.tar.gz.sha256")
+          (cd dist && sha256 "${root}.tar.gz" > "${root}.tar.gz.sha256")
           # Unversioned copies, so install.sh and self update can fetch through
           # the releases/latest redirect without discovering the version first.
           for rid in ${{ matrix.rid }} ${{ matrix.also }}; do
             cp "dist/${root}.tar.gz" "dist/dv-${rid}.tar.gz"
-            (cd dist && shasum -a 256 "dv-${rid}.tar.gz" > "dv-${rid}.tar.gz.sha256")
+            (cd dist && sha256 "dv-${rid}.tar.gz" > "dv-${rid}.tar.gz.sha256")
           done
           ls -l dist
 
