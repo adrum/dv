@@ -1,6 +1,6 @@
 [package]
 name = "dv"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A fast .NET SDK version manager: official SDKs, side-by-side runtimes and per-directory version resolution"
 repository = "https://github.com/adrum/dv"
