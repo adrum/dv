@@ -31,8 +31,13 @@ pub fn install(target: &Target, force: bool) -> Result<Outcome> {
     let config = Config::load()?;
     let rid = platform::current()?;
     let sdk = choose(&config, &rid, target)?;
+    install_sdk(&sdk, &rid, force)
+}
+
+/// Install one published SDK, already chosen.
+pub fn install_sdk(sdk: &Sdk, rid: &str, force: bool) -> Result<Outcome> {
     let version = sdk.version.clone();
-    let file = sdk.archive_for(&rid).ok_or_else(|| {
+    let file = sdk.archive_for(rid).ok_or_else(|| {
         Failed::new(
             exit::NOT_PUBLISHED,
             format!(".NET SDK {version} has no archive published for {rid}"),
@@ -126,7 +131,7 @@ pub fn install(target: &Target, force: bool) -> Result<Outcome> {
         &version,
         &ArtifactRecord {
             version: version.to_string(),
-            platform: rid.clone(),
+            platform: rid.to_string(),
             file: file.cache_name(),
             url: file.url.clone(),
             sha512: expected,
