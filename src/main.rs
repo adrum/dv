@@ -19,6 +19,8 @@ mod resolve;
 mod roots;
 mod selfupdate;
 mod shims;
+mod tracked;
+mod update;
 mod version;
 
 use std::path::PathBuf;
@@ -91,6 +93,16 @@ enum Command {
     Uninstall {
         /// Version or line to remove
         version: String,
+    },
+    /// Install the newest SDK every tracked line and global.json accepts,
+    /// then remove what nothing needs any more
+    Update {
+        /// Show what would change, and change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// Install updates but keep every SDK already installed
+        #[arg(long)]
+        no_prune: bool,
     },
     /// List installed SDKs
     List(ListArgs),
@@ -209,6 +221,7 @@ fn run() -> Result<ExitCode> {
     match cli.command {
         Command::Install { version, force } => cmd_install(version.as_deref(), force, format),
         Command::Uninstall { version } => cmd_uninstall(&version, format),
+        Command::Update { dry_run, no_prune } => cmd_update(dry_run, !no_prune, format),
         Command::List(args) => cmd_list(&args, format),
         Command::Pin { version } => cmd_pin(&version, format),
         Command::Default { version } => cmd_default(version.as_deref(), format),
@@ -244,11 +257,30 @@ fn current_resolution() -> Result<Resolution> {
 }
 
 fn cmd_install(version: Option<&str>, force: bool, format: Format) -> Result<ExitCode> {
-    let target = match version {
-        Some(version) => install::Target::Selector(version.parse()?),
-        None => install::Target::Request(requested_here()?),
+    // Read before installing, so the first run records what was already
+    // here as pins rather than also pinning what this install adds.
+    let mut tracked = tracked::Tracked::load()?;
+    let (target, requirement) = match version {
+        Some(version) => {
+            let selector: Selector = version.parse()?;
+            let requirement = tracked::Requirement::Explicit {
+                selector: selector.to_string(),
+            };
+            (install::Target::Selector(selector), requirement)
+        }
+        None => {
+            let (path, request) = requested_here()?;
+            (
+                install::Target::Request(request),
+                tracked::Requirement::GlobalJson { path },
+            )
+        }
     };
     let outcome = install::install(&target, force)?;
+    // What was asked for, so `dv update` can move it forward and knows this
+    // SDK is wanted.
+    tracked.add(requirement);
+    tracked.save()?;
     let root = installs::root(&outcome.version)?;
     format.emit(
         serde_json::json!({
@@ -274,11 +306,11 @@ fn cmd_install(version: Option<&str>, force: bool, format: Format) -> Result<Exi
 }
 
 /// What the `global.json` here asks for, for a bare `dv install`.
-fn requested_here() -> Result<globaljson::SdkRequest> {
+fn requested_here() -> Result<(PathBuf, globaljson::SdkRequest)> {
     let cwd = std::env::current_dir().context("could not read the current directory")?;
     match globaljson::nearest(&cwd)? {
         Some(file) => match file.request {
-            Ok(request) if request.is_pin() => Ok(request),
+            Ok(request) if request.is_pin() => Ok((file.path, request)),
             Ok(_) => bail!(
                 "{} does not name an SDK version — say which to install, as in \
                  `dv install lts`",
@@ -345,17 +377,49 @@ fn cmd_uninstall(version: &str, format: Format) -> Result<ExitCode> {
     let _lock = lock::acquire(
         &paths::versions_dir()?,
         &target.to_string(),
-        &format!("installing .NET SDK {target}"),
+        &format!("removing .NET SDK {target}"),
     )?;
+    let mut tracked = tracked::Tracked::load()?;
     installs::remove(&target)?;
     roots::sync(&[])?;
     shims::sync()?;
+    tracked.forget(&selector, &target);
+    tracked.save()?;
+
+    // Another requirement that still accepts this version would bring it
+    // back on the next update, which is worth saying now rather than then.
+    let config = Config::load()?;
+    let still_wanted: Vec<String> = tracked
+        .with_default(config.default.as_deref())
+        .iter()
+        .filter(|requirement| {
+            requirement
+                .want()
+                .is_ok_and(|want| want.satisfied_by(std::slice::from_ref(&target)).is_some())
+        })
+        .map(tracked::Requirement::label)
+        .collect();
 
     let remaining = installs::installed()?;
     format.emit(
-        serde_json::json!({ "version": target.to_string(), "removed": true }),
+        serde_json::json!({
+            "version": target.to_string(),
+            "removed": true,
+            "still_wanted_by": still_wanted,
+        }),
         || {
             println!("removed .NET SDK {target}");
+            if !still_wanted.is_empty() {
+                println!(
+                    "note: {} still {} it, so `dv update` would install it again",
+                    still_wanted.join(", "),
+                    if still_wanted.len() == 1 {
+                        "accepts"
+                    } else {
+                        "accept"
+                    },
+                );
+            }
             if remaining.is_empty() {
                 println!("no .NET SDK installed now — `dv install lts` gets one back");
             }
@@ -394,6 +458,19 @@ fn cmd_list(args: &ListArgs, format: Format) -> Result<ExitCode> {
         })
     });
 
+    let tracked_json: Vec<serde_json::Value> = tracked::Tracked::load()?
+        .requirements
+        .iter()
+        .map(|requirement| {
+            serde_json::json!({
+                "requirement": requirement.label(),
+                "source": requirement.source(),
+                "source_path": requirement.source_path().map(|p| p.display().to_string()),
+                "pinned": requirement.is_pinned(),
+            })
+        })
+        .collect();
+
     if args.remote {
         let freshness = if args.refresh {
             metadata::Freshness::Revalidate
@@ -411,12 +488,13 @@ fn cmd_list(args: &ListArgs, format: Format) -> Result<ExitCode> {
             &installed,
             installed_json,
             active_json,
+            tracked_json,
         );
     }
 
     if installed.is_empty() {
         format.emit(
-            serde_json::json!({ "installed": [], "active": null }),
+            serde_json::json!({ "installed": [], "active": null, "tracked": tracked_json }),
             || println!("no .NET SDK installed — run `dv install lts`"),
         )?;
         return Ok(ExitCode::SUCCESS);
@@ -424,7 +502,7 @@ fn cmd_list(args: &ListArgs, format: Format) -> Result<ExitCode> {
 
     // Marking the active one is the reason this command exists.
     format.emit(
-        serde_json::json!({ "installed": installed_json, "active": active_json }),
+        serde_json::json!({ "installed": installed_json, "active": active_json, "tracked": tracked_json }),
         || {
             for version in installed.iter().rev() {
                 if is_active(version) {
@@ -450,6 +528,7 @@ fn cmd_list_remote(
     installed: &[Version],
     installed_json: Vec<serde_json::Value>,
     active_json: Option<serde_json::Value>,
+    tracked_json: Vec<serde_json::Value>,
 ) -> Result<ExitCode> {
     let config = Config::load()?;
     let rid = platform::current()?;
@@ -532,6 +611,7 @@ fn cmd_list_remote(
             })).collect::<Vec<_>>(),
             "installed": installed_json,
             "active": active_json,
+            "tracked": tracked_json,
             // When the oldest metadata behind this answer was last confirmed
             // with Microsoft, in Unix seconds — what a caller showing cached
             // data needs to say "updated 4 minutes ago".
@@ -989,6 +1069,114 @@ fn cmd_cache(command: CacheCommand) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_update(dry_run: bool, prune: bool, format: Format) -> Result<ExitCode> {
+    let report = update::run(dry_run, prune)?;
+    let versions = |list: &[Version]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+    format.emit(
+        serde_json::json!({
+            "dry_run": dry_run,
+            "requirements": report.steps.iter().map(|step| serde_json::json!({
+                "requirement": step.requirement.label(),
+                "source": step.requirement.source(),
+                "source_path": step.requirement.source_path().map(|p| p.display().to_string()),
+                "pinned": step.requirement.is_pinned(),
+                "current": step.current.as_ref().map(ToString::to_string),
+                "target": step.target.as_ref().map(ToString::to_string),
+                "action": step.action(),
+                "problem": step.problem,
+            })).collect::<Vec<_>>(),
+            "installed": versions(&report.installed),
+            "removed": versions(&report.removed),
+            "dropped": report.dropped.iter().map(|(requirement, reason)| serde_json::json!({
+                "requirement": requirement.label(),
+                "source": requirement.source(),
+                "reason": reason,
+            })).collect::<Vec<_>>(),
+        }),
+        || {
+            if report.steps.is_empty() && report.dropped.is_empty() {
+                println!("nothing is tracked yet — `dv install <version>` tracks what it installs");
+                return;
+            }
+            // Line labels up, but give a long path its own line rather than
+            // padding every other row out to its width.
+            const LABEL_WIDTH: usize = 12;
+            let width = report
+                .steps
+                .iter()
+                .map(|step| step.requirement.label().len())
+                .filter(|len| *len <= LABEL_WIDTH)
+                .max()
+                .unwrap_or(0);
+            for step in &report.steps {
+                let label = step.requirement.label();
+                let current = step
+                    .current
+                    .as_ref()
+                    .map_or("—".to_string(), ToString::to_string);
+                let line = match (step.action(), &step.target) {
+                    ("none", _) => format!("{current}  up to date"),
+                    ("install", Some(target)) if step.current.is_some() => {
+                        format!("{current} → {target}")
+                    }
+                    ("install", Some(target)) => format!("→ {target}"),
+                    _ => format!(
+                        "{current}  {}",
+                        step.problem.as_deref().unwrap_or("unavailable")
+                    ),
+                };
+                let pinned = if step.requirement.is_pinned() {
+                    "  (pinned)"
+                } else {
+                    ""
+                };
+                if label.len() > LABEL_WIDTH {
+                    println!("  {label}\n  {:<width$}  {line}{pinned}", "");
+                } else {
+                    println!("  {label:<width$}  {line}{pinned}");
+                }
+            }
+            for (requirement, reason) in &report.dropped {
+                let verb = if dry_run { "would stop" } else { "stopped" };
+                println!("{verb} tracking {}: {reason}", requirement.label());
+            }
+            let verb = |done: &str, would: &str| {
+                if dry_run {
+                    would.to_string()
+                } else {
+                    done.to_string()
+                }
+            };
+            if !report.installed.is_empty() {
+                println!(
+                    "{} {}",
+                    verb("installed", "would install"),
+                    versions(&report.installed).join(", ")
+                );
+            }
+            if !report.removed.is_empty() {
+                println!(
+                    "{} {} — nothing tracked needs {}; `dv install <version>` gets one back",
+                    verb("removed", "would remove"),
+                    versions(&report.removed).join(", "),
+                    if report.removed.len() == 1 {
+                        "it"
+                    } else {
+                        "them"
+                    },
+                );
+            }
+            if dry_run {
+                println!("dry run — nothing was changed");
+            }
+        },
+    )?;
+    match update::failure(&report) {
+        Some(error) => Err(error),
+        None => Ok(ExitCode::SUCCESS),
+    }
 }
 
 fn cmd_rehash() -> Result<ExitCode> {
