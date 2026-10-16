@@ -30,6 +30,17 @@ pub fn fetch_text(url: &str) -> Result<String> {
         .with_context(|| format!("could not read the response from {url}"))
 }
 
+pub fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
+    let mut response = agent()
+        .get(url)
+        .call()
+        .map_err(|err| Failed::new(exit::NETWORK, format!("GET {url} failed: {err}")))?;
+    response
+        .body_mut()
+        .read_to_vec()
+        .with_context(|| format!("could not read the response from {url}"))
+}
+
 /// The answer to a conditional GET.
 pub enum Conditional {
     /// The copy the validators came from is still current.
