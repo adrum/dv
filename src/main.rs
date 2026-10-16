@@ -151,6 +151,10 @@ enum Command {
         #[arg(long)]
         hook: bool,
     },
+    /// The same SDK commands as `install`, `uninstall` and `list`, spelled
+    /// alongside `dv runtime`
+    #[command(subcommand)]
+    Sdk(SdkCommand),
     /// Install, remove or list runtimes without an SDK: runtime, aspnetcore,
     /// windowsdesktop
     #[command(subcommand)]
@@ -187,6 +191,28 @@ struct ListArgs {
     /// and never touch the network
     #[arg(long)]
     cached: bool,
+}
+
+/// `dv sdk install` and friends: aliases, for symmetry with `dv runtime` and
+/// for anyone arriving from dotnetup. The top-level commands stay the
+/// primary spelling — they are what pv's interface, and its wrappers, use.
+#[derive(Subcommand)]
+enum SdkCommand {
+    /// Same as `dv install`
+    Install {
+        /// Version or line to install
+        version: Option<String>,
+        /// Reinstall even when the same archive is already installed
+        #[arg(long)]
+        force: bool,
+    },
+    /// Same as `dv uninstall`
+    Uninstall {
+        /// Version or line to remove
+        version: String,
+    },
+    /// Same as `dv list`
+    List(ListArgs),
 }
 
 #[derive(Subcommand)]
@@ -256,6 +282,11 @@ fn run() -> Result<ExitCode> {
         Command::Uninstall { version } => cmd_uninstall(&version, format),
         Command::Update { dry_run, no_prune } => cmd_update(dry_run, !no_prune, format),
         Command::List(args) => cmd_list(&args, format),
+        Command::Sdk(SdkCommand::Install { version, force }) => {
+            cmd_install(version.as_deref(), force, format)
+        }
+        Command::Sdk(SdkCommand::Uninstall { version }) => cmd_uninstall(&version, format),
+        Command::Sdk(SdkCommand::List(args)) => cmd_list(&args, format),
         Command::Pin { version } => cmd_pin(&version, format),
         Command::Default { version } => cmd_default(version.as_deref(), format),
         Command::Which { command } => cmd_which(&command, format),

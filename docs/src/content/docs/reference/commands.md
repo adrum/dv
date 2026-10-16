@@ -23,6 +23,9 @@ fall back to previews when nothing else matches.
 | `dv list --remote --refresh` | …checking for new releases now rather than using metadata cached in the last 10 minutes |
 | `dv list --remote --cached` | …from cached metadata only, however old, never touching the network |
 
+`dv sdk install`, `dv sdk uninstall` and `dv sdk list` are the same commands,
+for symmetry with `dv runtime` and for anyone used to dotnetup's spelling.
+
 Older patches stay installable by exact version whether or not the listing
 shows them. The trimming is cosmetic, because an exact pin gets committed.
 
