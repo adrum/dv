@@ -11,7 +11,10 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.6", features = ["derive"] }
+cms = { version = "0.2.3", default-features = false }
+der = { version = "0.7.10", default-features = false }
 flate2 = "1.1.9"
+rsa = { version = "0.9.10", default-features = false, features = ["std", "sha2"] }
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
@@ -19,6 +22,7 @@ sha2 = "0.11.0"
 tar = "0.4.46"
 toml = "1.1.4"
 ureq = { version = "3.4.0", features = ["rustls"] }
+x509-cert = { version = "0.2.5", default-features = false }
 
 # Microsoft publishes Windows SDKs as zip archives, and only Windows needs to
 # read them.

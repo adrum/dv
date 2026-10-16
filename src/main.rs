@@ -19,6 +19,7 @@ mod resolve;
 mod roots;
 mod selfupdate;
 mod shims;
+mod signature;
 mod tracked;
 mod update;
 mod version;
