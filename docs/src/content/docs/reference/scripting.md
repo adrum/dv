@@ -104,6 +104,27 @@ When the network is unreachable, both fall back to the cached copy and say so
 on stderr; stdout is unaffected. Only a machine that has never fetched the
 metadata fails, with exit code `13`.
 
+`metadata_checked_at` in the output is when the oldest metadata behind the
+answer was last confirmed with Microsoft, in Unix seconds — enough to show
+"updated 4 minutes ago".
+
+### Showing a picker instantly
+
+A GUI should never wait on the network to draw. `--cached` answers from the
+cache, however old, and never makes a request — about 10 ms:
+
+```sh
+dv list --remote --cached --format json   # draw this now
+dv list --remote --format json            # then, in the background; redraw if it differs
+dv list --remote --refresh --format json  # on an explicit refresh
+```
+
+That is stale-while-revalidate, with the background work in the process
+built for it rather than in a dv process left running after the command
+returns. `--cached` exits `13` when something it needs has never been cached
+— for example the first run, or `--all` before EOL channels were ever
+listed — which is the signal to wait for a normal call instead.
+
 ### The rule that makes it usable
 
 **Data on stdout, diagnostics on stderr, always.** Progress, warnings and
