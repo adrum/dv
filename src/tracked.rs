@@ -12,8 +12,9 @@
 //! - **global-json** — a `global.json` that `dv install` was run against,
 //!   re-read on every update so an edited pin is followed and a deleted one
 //!   is dropped
-//! - **existing** — an SDK installed before dv tracked anything, kept as an
-//!   exact pin so upgrading dv never deletes something by surprise
+//!
+//! An installed SDK that no requirement tracks is simply untracked: `dv
+//! update` never moves or removes it.
 //!
 //! The `dv default` setting is a requirement too, read from the config file
 //! rather than stored here.
@@ -24,7 +25,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::globaljson::{self, SdkRequest};
-use crate::installs;
 use crate::paths;
 use crate::version::{Selector, Version};
 
@@ -36,9 +36,6 @@ pub enum Requirement {
     },
     GlobalJson {
         path: PathBuf,
-    },
-    Existing {
-        version: String,
     },
     /// The configured default. Never stored: it comes from `config.toml`.
     #[serde(skip)]
@@ -53,7 +50,6 @@ impl Requirement {
         match self {
             Requirement::Explicit { .. } => "explicit",
             Requirement::GlobalJson { .. } => "global-json",
-            Requirement::Existing { .. } => "existing",
             Requirement::Default { .. } => "default",
         }
     }
@@ -72,7 +68,6 @@ impl Requirement {
                 selector.clone()
             }
             Requirement::GlobalJson { path } => path.display().to_string(),
-            Requirement::Existing { version } => version.clone(),
         }
     }
 
@@ -84,10 +79,6 @@ impl Requirement {
                 .parse()
                 .map(Want::Selector)
                 .map_err(|err| err.to_string()),
-            Requirement::Existing { version } => version
-                .parse()
-                .map(|v| Want::Selector(Selector::Exact(v)))
-                .map_err(|err: anyhow::Error| err.to_string()),
             Requirement::GlobalJson { path } => {
                 let raw =
                     std::fs::read_to_string(path).map_err(|_| "it no longer exists".to_string())?;
@@ -150,35 +141,18 @@ fn path() -> Result<PathBuf> {
 }
 
 impl Tracked {
-    /// The tracked requirements, creating them on first use.
-    ///
-    /// The first time, every SDK already installed becomes an exact pin. dv
-    /// cannot know what the user meant by an install it never recorded, and
-    /// the only safe reading is "keep this one".
+    /// The tracked requirements — none, before the first install.
     pub fn load() -> Result<Self> {
         let path = path()?;
         match std::fs::read_to_string(&path) {
             Ok(raw) => serde_json::from_str(&raw).with_context(|| {
                 format!(
-                    "{} is not valid — fix it by hand, or delete it and dv will track \
-                     what is installed now",
+                    "{} is not valid — fix it by hand, or delete it to stop tracking \
+                     anything (installed SDKs stay installed)",
                     path.display()
                 )
             }),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let tracked = Self {
-                    requirements: installs::installed()?
-                        .into_iter()
-                        .map(|version| Requirement::Existing {
-                            version: version.to_string(),
-                        })
-                        .collect(),
-                };
-                if !tracked.requirements.is_empty() {
-                    tracked.save()?;
-                }
-                Ok(tracked)
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(err).with_context(|| format!("could not read {}", path.display())),
         }
     }
@@ -211,7 +185,6 @@ impl Tracked {
                 .drain(..)
                 .partition(|requirement| match requirement {
                     Requirement::Explicit { selector } => *selector == named || *selector == exact,
-                    Requirement::Existing { version } => *version == exact,
                     _ => false,
                 });
         self.requirements = kept;
@@ -251,9 +224,6 @@ mod tests {
                 explicit("10.0"),
                 Requirement::GlobalJson {
                     path: "/code/app/global.json".into(),
-                },
-                Requirement::Existing {
-                    version: "8.0.426".into(),
                 },
             ],
         };
@@ -310,17 +280,10 @@ mod tests {
     #[test]
     fn forgetting_removes_the_named_requirement_and_exact_pins_only() {
         let mut tracked = Tracked {
-            requirements: vec![
-                explicit("10.0"),
-                explicit("10.0.402"),
-                Requirement::Existing {
-                    version: "10.0.402".into(),
-                },
-                explicit("lts"),
-            ],
+            requirements: vec![explicit("10.0"), explicit("10.0.402"), explicit("lts")],
         };
         let gone = tracked.forget(&"10.0".parse().unwrap(), &v("10.0.402"));
-        assert_eq!(gone.len(), 3);
+        assert_eq!(gone.len(), 2);
         assert_eq!(tracked.requirements, vec![explicit("lts")]);
     }
 

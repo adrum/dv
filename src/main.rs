@@ -1089,6 +1089,7 @@ fn cmd_update(dry_run: bool, prune: bool, format: Format) -> Result<ExitCode> {
             })).collect::<Vec<_>>(),
             "installed": versions(&report.installed),
             "removed": versions(&report.removed),
+            "untracked": versions(&report.untracked),
             "dropped": report.dropped.iter().map(|(requirement, reason)| serde_json::json!({
                 "requirement": requirement.label(),
                 "source": requirement.source(),
@@ -1158,7 +1159,8 @@ fn cmd_update(dry_run: bool, prune: bool, format: Format) -> Result<ExitCode> {
             }
             if !report.removed.is_empty() {
                 println!(
-                    "{} {} — nothing tracked needs {}; `dv install <version>` gets one back",
+                    "{} {} — superseded, and nothing else needs {}; `dv install <version>` \
+                     gets one back",
                     verb("removed", "would remove"),
                     versions(&report.removed).join(", "),
                     if report.removed.len() == 1 {
@@ -1166,6 +1168,13 @@ fn cmd_update(dry_run: bool, prune: bool, format: Format) -> Result<ExitCode> {
                     } else {
                         "them"
                     },
+                );
+            }
+            if !report.untracked.is_empty() {
+                println!(
+                    "not tracked, left alone: {} — `dv install <version>` tracks one, \
+                     `dv uninstall <version>` removes it",
+                    versions(&report.untracked).join(", ")
                 );
             }
             if dry_run {

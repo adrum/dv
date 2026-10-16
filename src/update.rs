@@ -1,11 +1,12 @@
 //! `dv update` — move every tracked requirement to the newest SDK it accepts,
-//! then remove what no requirement needs any more.
+//! then remove the SDKs it moved them away from.
 //!
-//! Pruning is the half that needs care. An SDK is removed only when no
-//! tracked requirement, the configured default, or the current directory
-//! resolves to it — and dv says exactly what went and how to get it back.
-//! What dv cannot see is a `global.json` it was never told about, which is
-//! why `dv install` in a repository tracks that repository's file.
+//! Pruning is the half that needs care, so it is narrow: an update removes
+//! only an SDK it superseded — what a requirement resolved to before the
+//! update, now replaced — and only when nothing else still resolves to it:
+//! no other requirement, not the default, not the current directory. An SDK
+//! no requirement tracks is never touched; the report lists it as untracked.
+//! Every removal is named, with how to get it back.
 
 use anyhow::{Context, Result};
 
@@ -44,9 +45,10 @@ pub struct Report {
     pub steps: Vec<Step>,
     /// Versions installed by this update.
     pub installed: Vec<Version>,
-    /// Versions removed because nothing needs them — or, in a dry run, that
-    /// would be.
+    /// Versions this update superseded and removed — or, in a dry run, would.
     pub removed: Vec<Version>,
+    /// Installed versions no requirement resolves to, left alone.
+    pub untracked: Vec<Version>,
     /// Requirements no longer tracked: a `global.json` deleted or unpinned.
     pub dropped: Vec<(Requirement, String)>,
 }
@@ -136,13 +138,9 @@ pub fn run(dry_run: bool, prune: bool) -> Result<Report> {
     }
     after.sort();
 
+    let needed = needed(&wants, &after)?;
     let removed = if prune {
-        let needed = needed(&wants, &after)?;
-        let removable: Vec<Version> = after
-            .iter()
-            .filter(|version| !needed.contains(version))
-            .cloned()
-            .collect();
+        let removable = superseded(&steps, &needed);
         if !dry_run {
             for version in &removable {
                 let _lock = lock::acquire(
@@ -163,12 +161,31 @@ pub fn run(dry_run: bool, prune: bool) -> Result<Report> {
         shims::sync()?;
     }
 
+    let untracked = after
+        .into_iter()
+        .filter(|version| !needed.contains(version) && !removed.contains(version))
+        .collect();
     Ok(Report {
         steps,
         installed: if dry_run { to_install } else { newly_installed },
         removed,
+        untracked,
         dropped,
     })
+}
+
+/// What this update supersedes: each requirement's version before the update,
+/// where the update moves it to another, unless something still needs it.
+fn superseded(steps: &[Step], needed: &[Version]) -> Vec<Version> {
+    let mut gone: Vec<Version> = steps
+        .iter()
+        .filter(|step| step.action() == "install")
+        .filter_map(|step| step.current.clone())
+        .filter(|version| !needed.contains(version))
+        .collect();
+    gone.sort();
+    gone.dedup();
+    gone
 }
 
 /// Every installed version something still needs.
@@ -270,6 +287,27 @@ mod tests {
         assert!(kept.contains(&v("10.0.402")));
         assert!(kept.contains(&v("8.0.426")), "an exact pin is kept");
         assert!(!kept.contains(&v("10.0.401")), "superseded by 10.0.402");
+    }
+
+    #[test]
+    fn only_what_an_update_moves_past_is_removed() {
+        let step = |selector: &str, current: Option<&str>, target: &str| Step {
+            requirement: Requirement::Explicit {
+                selector: selector.into(),
+            },
+            current: current.map(v),
+            target: Some(v(target)),
+            problem: None,
+        };
+        let steps = [
+            step("10.0", Some("10.0.401"), "10.0.402"),
+            step("9.0", Some("9.0.310"), "9.0.310"),
+            step("lts", None, "10.0.402"),
+            // Moved past, but another requirement still resolves to it.
+            step("8.0.4xx", Some("8.0.420"), "8.0.426"),
+        ];
+        let needed = [v("10.0.402"), v("9.0.310"), v("8.0.420"), v("8.0.426")];
+        assert_eq!(superseded(&steps, &needed), vec![v("10.0.401")]);
     }
 
     #[test]

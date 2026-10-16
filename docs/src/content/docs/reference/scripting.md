@@ -46,8 +46,10 @@ a specific code exits `1`; treat `1` as "unknown", not as a stable category.
 available": each requirement carries `current`, `target` and an `action` of
 `none`, `install` or `unavailable`, alongside the `installed` and `removed`
 lists the update would produce. `dv list --format json` includes `tracked`,
-every requirement with its `source` (`explicit`, `global-json`, `existing`)
-and whether it is `pinned`.
+every requirement with its `source` (`explicit`, `global-json`, or `default`
+in `update` output) and whether it is `pinned`. `update` also lists
+`untracked`: installed SDKs no requirement resolves to, which it never
+removes.
 
 ```sh
 $ dv resolve --format json
