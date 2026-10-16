@@ -122,12 +122,15 @@ cache when offline.
 
 ## Integrity
 
-Every archive is checked against the sha512 Microsoft publishes before it is
-extracted, and verification **fails closed** — a missing or malformed hash is
-an error, not a reason to skip the check. Extraction refuses absolute paths,
-`..` and links. The host, `hostfxr` and SDK entry point are hashed after
-install, so `dv doctor` can report a tree that changed. Microsoft's metadata
-signatures are not verified yet.
+Microsoft signs its release metadata, and dv verifies that signature before
+it trusts a single hash in it: a detached CMS signature that must chain to
+DigiCert Trusted Root G4 (built into dv), belong to Microsoft, and not be past
+the expiration Microsoft signs into each file. Every archive is then checked
+against the sha512 in that verified metadata before it is extracted. Both
+**fail closed** — unsigned metadata, a bad signature or a missing hash is an
+error, never a reason to skip the check. Extraction refuses absolute paths,
+`..` and links, and `dv doctor` reports an installed tree that changed.
+Certificate revocation is not checked.
 
 ## Platforms
 

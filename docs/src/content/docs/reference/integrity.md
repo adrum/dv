@@ -5,11 +5,35 @@ description: What is verified, what that buys, and what dv checks after installa
 
 ## Verification
 
-dv installs Microsoft's archives and nothing else. Microsoft publishes a
-sha512 for every file in its release metadata, and dv checks it while the
-download streams, before anything is extracted. Verification **fails
-closed**: a file with a missing, empty or malformed hash is an error, not a
-reason to skip the check.
+dv installs Microsoft's archives and nothing else, and checks two things
+before it trusts one.
+
+**The release metadata is Microsoft's.** Every metadata file dv reads —
+`releases-index.json` and each channel's `releases.json` — has a detached
+CMS (PKCS #7) signature published beside it. dv verifies it before using or
+caching the file, in its own code, on every platform:
+
+- the signature covers exactly the bytes dv is about to use — one changed
+  byte fails it
+- the signer chains, signature by signature, to **DigiCert Trusted Root G4**,
+  which is built into dv rather than read from the system
+- the signer is Microsoft Corporation, with a code-signing certificate
+- the expiration Microsoft signs into each file has not passed. Signed
+  metadata is good for about 90 days, and a server handing out a file past
+  that is refused: correctly signed but stale is what a replay of old
+  metadata, hiding newer releases, would look like
+
+**The archive is the one that metadata describes.** Each archive is checked
+against the sha512 in the verified metadata while it downloads, before
+anything is extracted.
+
+Both fail closed. Unsigned metadata, a signature that does not verify, a
+missing, empty or malformed hash, or a mismatch all stop the install with exit
+code `14` — never a reason to skip the check.
+
+Cached metadata is verified again every time it is read, so a cache edited by
+hand is ignored rather than believed. Offline, a cached copy past its
+expiration is still used, with a warning that newer releases may exist.
 
 A download lands on a `.part` file and is only renamed into place once
 complete, so an interrupted download is never mistaken for a finished one. A
@@ -24,12 +48,22 @@ the destination. The new tree is swapped into place only after it unpacks
 completely and contains the `dotnet` host and the SDK it is named for, so a
 failed install leaves the previous one untouched.
 
-## What that actually buys
+## What is not checked
 
-The hash protects the archive **given trustworthy metadata**, which dv fetches
-over TLS from Microsoft. Microsoft also signs its release metadata; dv does not
-verify those signatures yet, and saying so is more useful than implying
-otherwise.
+**Revocation.** dv does not consult certificate revocation lists or OCSP,
+which would mean extra network requests on every listing. A revoked Microsoft
+signing certificate would still verify until a dv release stops trusting it.
+
+**Certificate dates.** The signed expiration is the freshness bound instead;
+Microsoft signs within its certificates' lifetimes.
+
+**Mirrors must carry the signatures.** `DV_RELEASES_URL` can point at a
+mirror, but it has to serve the `.p7s` files beside the metadata — dv has no
+option to skip verification.
+
+If Microsoft ever signs with a certificate that does not chain to the root
+dv carries, verification fails with exit code `14` and says so; `dv self
+update` brings a dv that knows the new root.
 
 ## After installation
 
