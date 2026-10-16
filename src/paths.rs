@@ -107,13 +107,6 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(home()?.join("config.toml"))
 }
 
-/// Record of the artifact a version was installed from, written next to the
-/// extracted tree so `dv doctor` can report tampering and `dv install` can
-/// detect a republished artifact.
-pub fn artifact_record(version: &str) -> Result<PathBuf> {
-    Ok(version_dir(version)?.join(".dv-artifact.json"))
-}
-
 /// Where `dotnet tool install --global` puts tools.
 ///
 /// The SDK honors `DOTNET_CLI_HOME` over the user's home for this, so dv does

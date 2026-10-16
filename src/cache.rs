@@ -29,7 +29,13 @@ pub fn entries() -> Result<Vec<Entry>> {
 
     let mut referenced: Vec<String> = Vec::new();
     for version in installs::installed()? {
-        if let Some(record) = installs::read_record(&version)? {
+        if let Some(record) = installs::read_record(&paths::version_dir(&version.to_string())?)? {
+            referenced.push(record.file);
+        }
+    }
+
+    for runtime in crate::runtimes::installed()? {
+        if let Some(record) = installs::read_record(&runtime.dir()?)? {
             referenced.push(record.file);
         }
     }

@@ -106,9 +106,10 @@ pub fn command_file(command: &str) -> String {
     }
 }
 
-/// Hash the files in an installed tree that decide what runs.
-pub fn hash_tree(version: &Version) -> Result<BTreeMap<String, String>> {
-    let tree = paths::version_dir(&version.to_string())?;
+/// Hash the files in an installed tree — an SDK's or a runtime's — that
+/// decide what runs: the host, hostfxr, and the SDK's entry point if there
+/// is one.
+pub fn hash_tree(tree: &Path) -> Result<BTreeMap<String, String>> {
     let mut hashes = BTreeMap::new();
     let mut add = |relative: String| -> Result<()> {
         let path = tree.join(&relative);
@@ -119,7 +120,13 @@ pub fn hash_tree(version: &Version) -> Result<BTreeMap<String, String>> {
     };
 
     add(platform::exe("dotnet"))?;
-    add(format!("sdk/{version}/dotnet.dll"))?;
+    if let Ok(entries) = std::fs::read_dir(tree.join("sdk")) {
+        for entry in entries.flatten() {
+            if let Some(sdk) = entry.file_name().to_str() {
+                add(format!("sdk/{sdk}/dotnet.dll"))?;
+            }
+        }
+    }
     // hostfxr is what reads global.json and picks the SDK, so it is the file
     // that most decides what a `dotnet` command does.
     if let Ok(entries) = std::fs::read_dir(tree.join("host").join("fxr")) {
@@ -142,8 +149,7 @@ pub fn hash_tree(version: &Version) -> Result<BTreeMap<String, String>> {
 }
 
 /// Recorded files whose contents no longer match, and those that have gone.
-pub fn changed_files(version: &Version, record: &ArtifactRecord) -> Result<Vec<String>> {
-    let tree = paths::version_dir(&version.to_string())?;
+pub fn changed_files(tree: &Path, record: &ArtifactRecord) -> Result<Vec<String>> {
     let mut changed = Vec::new();
     for (relative, expected) in &record.files {
         let full = tree.join(relative);
@@ -156,8 +162,13 @@ pub fn changed_files(version: &Version, record: &ArtifactRecord) -> Result<Vec<S
     Ok(changed)
 }
 
-pub fn read_record(version: &Version) -> Result<Option<ArtifactRecord>> {
-    let path = paths::artifact_record(&version.to_string())?;
+/// The record written next to an installed tree.
+pub fn record_path(tree: &Path) -> PathBuf {
+    tree.join(".dv-artifact.json")
+}
+
+pub fn read_record(tree: &Path) -> Result<Option<ArtifactRecord>> {
+    let path = record_path(tree);
     match std::fs::read_to_string(&path) {
         Ok(raw) => Ok(serde_json::from_str(&raw).ok()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -165,8 +176,8 @@ pub fn read_record(version: &Version) -> Result<Option<ArtifactRecord>> {
     }
 }
 
-pub fn write_record(version: &Version, record: &ArtifactRecord) -> Result<()> {
-    let path = paths::artifact_record(&version.to_string())?;
+pub fn write_record(tree: &Path, record: &ArtifactRecord) -> Result<()> {
+    let path = record_path(tree);
     let body = serde_json::to_string_pretty(record)?;
     std::fs::write(&path, format!("{body}\n"))
         .with_context(|| format!("could not write {}", path.display()))

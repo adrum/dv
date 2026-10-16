@@ -36,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use crate::installs;
 use crate::paths;
 use crate::platform;
+use crate::runtimes;
 use crate::version::Version;
 
 /// The record of what dv placed in a root, keyed by path relative to it.
@@ -43,8 +44,49 @@ const RECORD: &str = ".dv-root.json";
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Record {
-    /// Relative path → the installed SDK it was linked from.
+    /// Relative path → the tree it was linked from, as an `Owner` key.
     entries: BTreeMap<String, String>,
+}
+
+/// A tree roots are composed from: an SDK in `versions/`, or a runtime in
+/// `runtimes/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Owner {
+    /// The tree's path relative to dv's home — how records name it.
+    key: String,
+    /// Which copy wins when two trees carry the same entry: the newer one,
+    /// whose host understands every older SDK.
+    order: Version,
+}
+
+impl Owner {
+    pub fn sdk(version: &Version) -> Self {
+        Self {
+            key: format!("versions/{version}"),
+            order: version.clone(),
+        }
+    }
+
+    pub fn runtime(component: runtimes::Component, version: &Version) -> Self {
+        Self {
+            key: format!("runtimes/{component}-{version}"),
+            order: version.clone(),
+        }
+    }
+
+    fn tree(&self, home: &Path) -> PathBuf {
+        home.join(&self.key)
+    }
+
+    /// The tree a recorded key names. Records written before runtimes
+    /// existed name an SDK by its version alone.
+    fn tree_of_key(home: &Path, key: &str) -> PathBuf {
+        if key.contains('/') {
+            home.join(key)
+        } else {
+            home.join("versions").join(key)
+        }
+    }
 }
 
 /// Which roots an entry belongs in.
@@ -62,53 +104,57 @@ enum Scope {
 struct Entry {
     relative: String,
     scope: Scope,
-    owner: Version,
+    owner: Owner,
 }
 
 /// Rebuild every root to match what is installed.
 ///
-/// `refreshed` lists SDKs whose trees were just replaced (a forced reinstall):
+/// `refreshed` lists trees that were just replaced (a forced reinstall):
 /// their entries are relinked even though the paths have not changed, so no
 /// root keeps the old files alive.
-pub fn sync(refreshed: &[Version]) -> Result<()> {
+pub fn sync(refreshed: &[Owner]) -> Result<()> {
     let installed = installs::installed()?;
-    let _lock = crate::lock::acquire(&paths::home()?, "roots", "updating install roots")?;
+    let runtimes = runtimes::installed()?;
+    let home = paths::home()?;
+    let _lock = crate::lock::acquire(&home, "roots", "updating install roots")?;
 
-    let versions = paths::versions_dir()?;
     let mut entries = Vec::new();
     for version in &installed {
-        entries.extend(entries_of(version)?);
+        entries.extend(entries_of(&Owner::sdk(version), &home)?);
+    }
+    for runtime in &runtimes {
+        entries.extend(entries_of(
+            &Owner::runtime(runtime.component, &runtime.version),
+            &home,
+        )?);
     }
 
     for version in &installed {
-        let desired = desired_for(&entries, Some(version));
-        sync_root(&versions, &installs::root(version)?, &desired, refreshed)?;
+        let desired = desired_for(&entries, Some(&Owner::sdk(version)));
+        sync_root(&home, &installs::root(version)?, &desired, refreshed)?;
     }
     remove_stale_roots(&installed)?;
 
+    // The combined root holds everything — and is the only root when nothing
+    // but runtimes is installed, which is what runs apps on such a machine.
     let combined = paths::combined_root()?;
-    if installed.is_empty() {
+    if installed.is_empty() && runtimes.is_empty() {
         remove_root(&combined)?;
     } else {
-        sync_root(
-            &versions,
-            &combined,
-            &desired_for(&entries, None),
-            refreshed,
-        )?;
+        sync_root(&home, &combined, &desired_for(&entries, None), refreshed)?;
     }
     Ok(())
 }
 
-/// What an SDK tree offers, at the granularity roots are composed from.
-fn entries_of(version: &Version) -> Result<Vec<Entry>> {
-    let tree = paths::version_dir(&version.to_string())?;
+/// What a tree offers, at the granularity roots are composed from.
+fn entries_of(owner: &Owner, home: &Path) -> Result<Vec<Entry>> {
+    let tree = owner.tree(home);
     let mut entries = Vec::new();
     let mut add = |relative: String, scope: Scope| {
         entries.push(Entry {
             relative,
             scope,
-            owner: version.clone(),
+            owner: owner.clone(),
         })
     };
 
@@ -161,11 +207,11 @@ fn entries_of(version: &Version) -> Result<Vec<Entry>> {
     Ok(entries)
 }
 
-/// The entries a root should hold, each from the newest SDK that has it.
+/// The entries a root should hold, each from the newest tree that has it.
 ///
 /// `only` is the SDK a per-SDK root is for; `None` is the combined root.
-fn desired_for(entries: &[Entry], only: Option<&Version>) -> BTreeMap<String, Version> {
-    let mut desired: BTreeMap<String, Version> = BTreeMap::new();
+fn desired_for(entries: &[Entry], only: Option<&Owner>) -> BTreeMap<String, Owner> {
+    let mut desired: BTreeMap<String, Owner> = BTreeMap::new();
     for entry in entries {
         if let Some(only) = only
             && entry.scope == Scope::PerSdk
@@ -177,7 +223,7 @@ fn desired_for(entries: &[Entry], only: Option<&Version>) -> BTreeMap<String, Ve
         // SDK, and the reverse is not true.
         let keep = desired
             .get(&entry.relative)
-            .is_none_or(|current| entry.owner > *current);
+            .is_none_or(|current| entry.owner.order > current.order);
         if keep {
             desired.insert(entry.relative.clone(), entry.owner.clone());
         }
@@ -186,10 +232,10 @@ fn desired_for(entries: &[Entry], only: Option<&Version>) -> BTreeMap<String, Ve
 }
 
 fn sync_root(
-    versions: &Path,
+    home: &Path,
     root: &Path,
-    desired: &BTreeMap<String, Version>,
-    refreshed: &[Version],
+    desired: &BTreeMap<String, Owner>,
+    refreshed: &[Owner],
 ) -> Result<()> {
     paths::ensure_dir(root)?;
     let mut record = read_record(root)?;
@@ -202,12 +248,12 @@ fn sync_root(
         .map(|(relative, owner)| (relative.clone(), owner.clone()))
         .collect();
     for (relative, owner) in recorded {
-        let keep = desired.get(&relative).is_some_and(|wanted| {
-            wanted.to_string() == owner && !refreshed.iter().any(|r| r == wanted)
-        });
+        let keep = desired
+            .get(&relative)
+            .is_some_and(|wanted| wanted.key == owner && !refreshed.contains(wanted));
         if !keep {
             unlink_entry(
-                &versions.join(&owner).join(&relative),
+                &Owner::tree_of_key(home, &owner).join(&relative),
                 &root.join(&relative),
             )?;
             prune_empty_parents(root, &relative);
@@ -221,7 +267,7 @@ fn sync_root(
         if record.entries.contains_key(relative) && target.exists() {
             continue;
         }
-        let source = versions.join(owner.to_string()).join(relative);
+        let source = owner.tree(home).join(relative);
         if target.is_dir() && source.is_dir() {
             // Something is already here: what is left of an entry after its
             // own files were removed — a workload's manifests, say — or an
@@ -231,7 +277,7 @@ fn sync_root(
             remove_path(&target)?;
             link_tree(&source, &target)?;
         }
-        record.entries.insert(relative.clone(), owner.to_string());
+        record.entries.insert(relative.clone(), owner.key.clone());
         write_record(root, &record)?;
     }
     Ok(())
@@ -436,7 +482,7 @@ mod tests {
         Entry {
             relative: relative.into(),
             scope,
-            owner: v(owner),
+            owner: Owner::sdk(&v(owner)),
         }
     }
 
@@ -466,7 +512,7 @@ mod tests {
 
     #[test]
     fn a_per_sdk_root_has_one_sdk_and_every_runtime() {
-        let desired = desired_for(&sample(), Some(&v("8.0.426")));
+        let desired = desired_for(&sample(), Some(&Owner::sdk(&v("8.0.426"))));
         let keys: Vec<&str> = desired.keys().map(String::as_str).collect();
         assert_eq!(
             keys,
@@ -479,7 +525,7 @@ mod tests {
             ]
         );
         // The newest host, even in an older SDK's root.
-        assert_eq!(desired["dotnet"], v("10.0.402"));
+        assert_eq!(desired["dotnet"], Owner::sdk(&v("10.0.402")));
     }
 
     #[test]
@@ -536,7 +582,7 @@ mod tests {
         write_record(&root, &record).unwrap();
 
         // Desired is empty: the recorded entry goes, the workload stays.
-        sync_root(&dir.path().join("versions"), &root, &BTreeMap::new(), &[]).unwrap();
+        sync_root(dir.path(), &root, &BTreeMap::new(), &[]).unwrap();
         assert!(!root.join("sdk/9.0.105").exists());
         assert!(workload.join("pack.txt").is_file());
         assert!(read_record(&root).unwrap().entries.is_empty());
@@ -553,8 +599,8 @@ mod tests {
 
         let root = dir.path().join("root");
         let mut desired = BTreeMap::new();
-        desired.insert(entry.to_string(), v("8.0.426"));
-        sync_root(&versions, &root, &desired, &[]).unwrap();
+        desired.insert(entry.to_string(), Owner::sdk(&v("8.0.426")));
+        sync_root(dir.path(), &root, &desired, &[]).unwrap();
 
         // `dotnet workload update` adds a side-by-side manifest version.
         let update = root.join(entry).join("34.0.154");
@@ -563,7 +609,7 @@ mod tests {
 
         // A forced reinstall relinks the entry from the fresh tree.
         std::fs::write(shipped.join("WorkloadManifest.json"), b"reinstalled").unwrap();
-        sync_root(&versions, &root, &desired, &[v("8.0.426")]).unwrap();
+        sync_root(dir.path(), &root, &desired, &[Owner::sdk(&v("8.0.426"))]).unwrap();
         assert_eq!(
             std::fs::read(root.join(entry).join("WorkloadManifest.json")).unwrap(),
             b"reinstalled"
@@ -574,7 +620,7 @@ mod tests {
         );
 
         // Dropping the entry entirely still keeps what dv did not ship.
-        sync_root(&versions, &root, &BTreeMap::new(), &[]).unwrap();
+        sync_root(dir.path(), &root, &BTreeMap::new(), &[]).unwrap();
         assert!(!root.join(entry).join("WorkloadManifest.json").exists());
         assert!(update.join("WorkloadManifest.json").is_file());
     }

@@ -381,7 +381,8 @@ fn global_tools_check() -> Result<Option<Finding>> {
 fn install_checks(installed: &[Version]) -> Result<Vec<Finding>> {
     let mut findings = Vec::new();
     for version in installed {
-        match installs::read_record(version)? {
+        let tree = paths::version_dir(&version.to_string())?;
+        match installs::read_record(&tree)? {
             None => findings.push(Finding::warn(
                 format!("{version}: no install record"),
                 format!(
@@ -390,7 +391,7 @@ fn install_checks(installed: &[Version]) -> Result<Vec<Finding>> {
                 ),
             )),
             Some(record) => {
-                let changed = installs::changed_files(version, &record)?;
+                let changed = installs::changed_files(&tree, &record)?;
                 if !changed.is_empty() {
                     findings.push(Finding::problem(
                         format!("{version}: changed since install — {}", changed.join(", ")),
@@ -413,8 +414,28 @@ fn install_checks(installed: &[Version]) -> Result<Vec<Finding>> {
             }
         }
     }
+    for runtime in crate::runtimes::installed()? {
+        let tree = runtime.dir()?;
+        let label = format!("{} {}", runtime.component.display(), runtime.version);
+        let reinstall = format!("`dv runtime install {runtime} --force`");
+        match installs::read_record(&tree)? {
+            None => findings.push(Finding::warn(
+                format!("{label}: no install record"),
+                format!("dv cannot tell what this was installed from — {reinstall} re-records it"),
+            )),
+            Some(record) => {
+                let changed = installs::changed_files(&tree, &record)?;
+                if !changed.is_empty() {
+                    findings.push(Finding::problem(
+                        format!("{label}: changed since install — {}", changed.join(", ")),
+                        format!("reinstall with {reinstall}"),
+                    ));
+                }
+            }
+        }
+    }
     if findings.is_empty() {
-        findings.push(Finding::ok("installed SDKs look intact"));
+        findings.push(Finding::ok("installed SDKs and runtimes look intact"));
     }
     Ok(findings)
 }
