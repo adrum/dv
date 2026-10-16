@@ -163,8 +163,12 @@ struct ListArgs {
     all: bool,
     /// With --remote, check for new releases now instead of using release
     /// metadata cached in the last few minutes
-    #[arg(long)]
+    #[arg(long, conflicts_with = "cached")]
     refresh: bool,
+    /// With --remote, answer from cached release metadata only, however old,
+    /// and never touch the network
+    #[arg(long)]
+    cached: bool,
 }
 
 #[derive(Subcommand)]
@@ -205,7 +209,7 @@ fn run() -> Result<ExitCode> {
     match cli.command {
         Command::Install { version, force } => cmd_install(version.as_deref(), force, format),
         Command::Uninstall { version } => cmd_uninstall(&version, format),
-        Command::List(args) => cmd_list(args.remote, args.all, args.refresh, format),
+        Command::List(args) => cmd_list(&args, format),
         Command::Pin { version } => cmd_pin(&version, format),
         Command::Default { version } => cmd_default(version.as_deref(), format),
         Command::Which { command } => cmd_which(&command, format),
@@ -363,7 +367,7 @@ fn cmd_uninstall(version: &str, format: Format) -> Result<ExitCode> {
 /// Patches per feature band shown by `dv list --remote` without `--all`.
 const REMOTE_PATCHES_PER_BAND: usize = 2;
 
-fn cmd_list(remote: bool, all: bool, refresh: bool, format: Format) -> Result<ExitCode> {
+fn cmd_list(args: &ListArgs, format: Format) -> Result<ExitCode> {
     let installed = installs::installed()?;
     let active = current_resolution().ok();
     let is_active = |version: &Version| {
@@ -390,10 +394,19 @@ fn cmd_list(remote: bool, all: bool, refresh: bool, format: Format) -> Result<Ex
         })
     });
 
-    if remote {
+    if args.remote {
+        let freshness = if args.refresh {
+            metadata::Freshness::Revalidate
+        } else if args.cached {
+            metadata::Freshness::CacheOnly
+        } else {
+            // Cached metadata keeps a version picker instant; it changes a
+            // few times a month, and `--refresh` is there for when it just did.
+            metadata::Freshness::MaxAge(metadata::LIST_MAX_AGE)
+        };
         return cmd_list_remote(
-            all,
-            refresh,
+            args.all,
+            freshness,
             format,
             &installed,
             installed_json,
@@ -432,7 +445,7 @@ fn cmd_list(remote: bool, all: bool, refresh: bool, format: Format) -> Result<Ex
 /// both, and two calls can disagree about a version installed in between.
 fn cmd_list_remote(
     all: bool,
-    refresh: bool,
+    freshness: metadata::Freshness,
     format: Format,
     installed: &[Version],
     installed_json: Vec<serde_json::Value>,
@@ -440,13 +453,6 @@ fn cmd_list_remote(
 ) -> Result<ExitCode> {
     let config = Config::load()?;
     let rid = platform::current()?;
-    // Cached metadata keeps a version picker instant; it changes a few times
-    // a month, and `--refresh` is there for the moment it just did.
-    let freshness = if refresh {
-        metadata::Freshness::Revalidate
-    } else {
-        metadata::Freshness::MaxAge(metadata::LIST_MAX_AGE)
-    };
     let index = releases::fetch_index(&config.releases_url(), freshness)?;
 
     // Supported channels, plus any channel something installed belongs to —
@@ -526,6 +532,10 @@ fn cmd_list_remote(
             })).collect::<Vec<_>>(),
             "installed": installed_json,
             "active": active_json,
+            // When the oldest metadata behind this answer was last confirmed
+            // with Microsoft, in Unix seconds — what a caller showing cached
+            // data needs to say "updated 4 minutes ago".
+            "metadata_checked_at": metadata::oldest_check(),
         }),
         || {
             let mut current_channel = String::new();

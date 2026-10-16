@@ -12,11 +12,13 @@
 //! used anyway — with a warning, never silently.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::exit::{self, Failed};
 use crate::net::{self, Conditional};
 use crate::paths;
 
@@ -27,6 +29,10 @@ pub enum Freshness {
     MaxAge(Duration),
     /// Always ask the server whether the copy is current.
     Revalidate,
+    /// Never ask: answer from the cache whatever its age, or fail. For a
+    /// caller that shows cached data at once and refreshes in its own
+    /// background, rather than dv leaving a process behind to do it.
+    CacheOnly,
 }
 
 /// How long `dv list --remote` trusts cached metadata. Microsoft publishes
@@ -43,6 +49,27 @@ struct Record {
     checked_at: u64,
 }
 
+/// The oldest moment any metadata used by this process was confirmed with
+/// the server, in Unix seconds — `u64::MAX` until something is fetched.
+///
+/// A listing is assembled from several documents of different ages, and the
+/// honest answer to "how current is this?" is the oldest of them. Kept as
+/// process state because a listing is one short-lived command, and threading
+/// an age through every caller of `fetch` would buy nothing else.
+static OLDEST_CHECK: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// When the oldest metadata behind this command was last confirmed current.
+pub fn oldest_check() -> Option<u64> {
+    match OLDEST_CHECK.load(Ordering::Relaxed) {
+        u64::MAX => None,
+        at => Some(at),
+    }
+}
+
+fn note_check(at: u64) {
+    OLDEST_CHECK.fetch_min(at, Ordering::Relaxed);
+}
+
 pub fn dir() -> Result<PathBuf> {
     Ok(paths::cache_dir()?.join("metadata"))
 }
@@ -54,10 +81,25 @@ pub fn fetch(url: &str, freshness: Freshness) -> Result<String> {
     let cached = read_cached(&body_path, &record_path, url);
     let now = crate::installs::now_unix();
 
+    if freshness == Freshness::CacheOnly {
+        return match cached {
+            Some((body, record)) => {
+                note_check(record.checked_at);
+                Ok(body)
+            }
+            None => Err(Failed::new(
+                exit::NETWORK,
+                "nothing is cached yet — run `dv list --remote` once with a network \
+                 connection",
+            )),
+        };
+    }
+
     if let Some((body, record)) = &cached
         && let Freshness::MaxAge(limit) = freshness
         && now.saturating_sub(record.checked_at) < limit.as_secs()
     {
+        note_check(record.checked_at);
         return Ok(body.clone());
     }
 
@@ -72,11 +114,15 @@ pub fn fetch(url: &str, freshness: Freshness) -> Result<String> {
             // Best effort: failing to note the check only means the next
             // call asks again.
             let _ = write_atomic(&record_path, &serde_json::to_vec(&record)?);
+            note_check(now);
             Ok(body)
         }
         // A 304 with nothing cached cannot happen unless validators were
         // sent; fetch again plainly rather than trust it.
-        Ok(Conditional::NotModified) => net::fetch_text(url),
+        Ok(Conditional::NotModified) => {
+            note_check(now);
+            net::fetch_text(url)
+        }
         Ok(Conditional::Modified {
             body,
             etag,
@@ -92,6 +138,7 @@ pub fn fetch(url: &str, freshness: Freshness) -> Result<String> {
                 last_modified,
                 now,
             );
+            note_check(now);
             Ok(body)
         }
         Err(err) => match cached {
@@ -100,6 +147,7 @@ pub fn fetch(url: &str, freshness: Freshness) -> Result<String> {
                     "dv: could not reach {url} ({err:#}) — using release metadata cached {} ago",
                     describe_age(now.saturating_sub(record.checked_at))
                 );
+                note_check(record.checked_at);
                 Ok(body)
             }
             None => Err(err),
