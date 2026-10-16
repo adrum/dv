@@ -25,6 +25,7 @@ export default defineConfig({
           items: [
             { label: 'Getting started', slug: 'guides/getting-started' },
             { label: 'How a version is chosen', slug: 'guides/resolution' },
+            { label: 'Keeping SDKs up to date', slug: 'guides/updating' },
             { label: 'Tools and workloads', slug: 'guides/tools-and-workloads' },
             { label: 'Troubleshooting', slug: 'guides/troubleshooting' },
           ],

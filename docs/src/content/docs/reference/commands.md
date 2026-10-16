@@ -13,7 +13,10 @@ fall back to previews when nothing else matches.
 |---|---|
 | `dv install <version>` | install an SDK (`--force` reinstalls) |
 | `dv install` | install what the nearest `global.json` asks for |
-| `dv uninstall <version>` | remove an installed SDK |
+| `dv uninstall <version>` | remove an installed SDK, and stop tracking it |
+| `dv update` | install the newest SDK each tracked requirement accepts, remove what nothing needs |
+| `dv update --dry-run` | …show what would change, and change nothing |
+| `dv update --no-prune` | …install updates, keep every SDK already installed |
 | `dv list` | installed SDKs, the active one marked with its source |
 | `dv list --remote` | what can be installed, beside what is — newest 2 per feature band |
 | `dv list --remote --all` | …including end-of-life channels and every patch |
@@ -88,5 +91,6 @@ writes is plain text you can read and grep:
   shims/dotnet            real files on PATH
   cache/                  downloaded archives
   cache/metadata/         Microsoft's release metadata, cached
+  tracked.json            what was asked for — what `dv update` moves forward
   config.toml             default version, release index location
 ```

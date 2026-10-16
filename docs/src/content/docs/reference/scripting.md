@@ -39,8 +39,15 @@ a specific code exits `1`; treat `1` as "unknown", not as a stable category.
 
 ## JSON output
 
-`--format json` works on `install`, `uninstall`, `list`, `pin`, `default`,
-`which`, `resolve` and `doctor`.
+`--format json` works on `install`, `uninstall`, `update`, `list`, `pin`,
+`default`, `which`, `resolve` and `doctor`.
+
+`dv update --dry-run --format json` is the cheap way to show "updates
+available": each requirement carries `current`, `target` and an `action` of
+`none`, `install` or `unavailable`, alongside the `installed` and `removed`
+lists the update would produce. `dv list --format json` includes `tracked`,
+every requirement with its `source` (`explicit`, `global-json`, `existing`)
+and whether it is `pinned`.
 
 ```sh
 $ dv resolve --format json
