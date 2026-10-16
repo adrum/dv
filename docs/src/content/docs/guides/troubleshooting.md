@@ -35,6 +35,23 @@ problem another dotnet comes before dv's shims: /usr/local/share/dotnet/dotnet
 `dv init` prepends, so the usual cause is a later line in your profile putting
 another prefix in front.
 
+## dotnetup is installed too
+
+[dotnetup](https://learn.microsoft.com/dotnet/core/tools/dotnetup/) is
+Microsoft's own SDK manager. It and dv can both be installed; what matters is
+which one's `dotnet` comes first on `PATH`. When dotnetup's does, dv's pins,
+default and overrides do not apply, and doctor says so:
+
+```
+problem dotnetup's dotnet comes before dv's shims (…/dotnetup/dotnet/dotnet),
+        so dv's pins, default and overrides do not apply
+        `dotnetup env set none` takes dotnetup's dotnet off PATH (it stays
+        usable as `dotnetup dotnet`) — or move dv's shims earlier in PATH
+```
+
+dotnetup can also set `DOTNET_ROOT` to its own install, which sends global
+tools to its runtimes; doctor reports that separately.
+
 ## Global tools use the wrong .NET
 
 ```

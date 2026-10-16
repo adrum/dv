@@ -89,6 +89,7 @@ pub fn run() -> Result<Vec<Finding>> {
     findings.push(home_check(&paths::home()?));
     findings.extend(path_checks()?);
     findings.push(dotnet_root_check()?);
+    findings.extend(dotnetup_check());
     if let Some(finding) = global_tools_check()? {
         findings.push(finding);
     }
@@ -168,17 +169,34 @@ fn path_checks() -> Result<Vec<Finding>> {
             .iter()
             .map(|path| path.display().to_string())
             .collect();
-        findings.push(Finding::problem(
-            format!(
-                "another dotnet comes before dv's shims: {}",
-                owners.join(", ")
-            ),
-            format!(
-                "move {} earlier in PATH — `eval \"$(dv init zsh)\"` at the end of your \
-                 profile does that",
-                status.shims.display()
-            ),
-        ));
+        let move_shims = format!(
+            "move {} earlier in PATH — `eval \"$(dv init zsh)\"` at the end of your \
+             profile does that",
+            status.shims.display()
+        );
+        findings.push(
+            if status.shadowed_by.iter().any(|path| dotnetup::owns(path)) {
+                Finding::problem(
+                    format!(
+                        "dotnetup's dotnet comes before dv's shims ({}), so dv's pins, \
+                         default and overrides do not apply",
+                        owners.join(", ")
+                    ),
+                    format!(
+                        "`dotnetup env set none` takes dotnetup's dotnet off PATH (it stays \
+                         usable as `dotnetup dotnet`) — or {move_shims}"
+                    ),
+                )
+            } else {
+                Finding::problem(
+                    format!(
+                        "another dotnet comes before dv's shims: {}",
+                        owners.join(", ")
+                    ),
+                    move_shims,
+                )
+            },
+        );
     }
 
     // What the shell would actually run, which is the question users are
@@ -232,6 +250,18 @@ fn dotnet_root_check() -> Result<Finding> {
             "DOTNET_ROOT is dv's combined root ({})",
             combined.display()
         )),
+        Some(value) if dotnetup::owns(Path::new(&value)) => Finding::warn(
+            format!(
+                "DOTNET_ROOT is dotnetup's install ({}), so global tools and app hosts use \
+                 dotnetup's runtimes, not dv's",
+                Path::new(&value).display()
+            ),
+            format!(
+                "`dotnetup env set none` stops dotnetup setting it; then `dv init` points it \
+                 at {}",
+                combined.display()
+            ),
+        ),
         Some(value) => Finding::warn(
             format!(
                 "DOTNET_ROOT is {}, so global tools and app hosts use that install, not dv's",
@@ -240,6 +270,89 @@ fn dotnet_root_check() -> Result<Finding> {
             advice,
         ),
     })
+}
+
+/// dotnetup, Microsoft's own SDK manager, alongside dv.
+///
+/// Both can be installed, and that is fine as long as one of them clearly
+/// owns `dotnet`. The checks above say when dotnetup's comes first; this one
+/// says it is present at all, which is the first thing to know when a
+/// directory resolves to an SDK dv did not choose.
+fn dotnetup_check() -> Option<Finding> {
+    let found = dotnetup::detect()?;
+    let mut parts = Vec::new();
+    if let Some(binary) = &found.binary {
+        parts.push(format!("dotnetup at {}", binary.display()));
+    }
+    if let Some(root) = &found.root {
+        parts.push(format!("its SDKs in {}", root.display()));
+    }
+    Some(Finding::ok(format!(
+        "dotnetup is also installed ({}) — dv's shims decide which dotnet runs as long as they \
+         come first on PATH",
+        parts.join(", ")
+    )))
+}
+
+/// Where dotnetup keeps things, per its documentation.
+mod dotnetup {
+    use std::path::{Path, PathBuf};
+
+    pub struct Found {
+        pub binary: Option<PathBuf>,
+        /// Its managed .NET installation root, when it has one.
+        pub root: Option<PathBuf>,
+    }
+
+    /// dotnetup's data directory: `DOTNET_DOTNETUP_DATA_DIR`, else the
+    /// platform's per-user application data directory.
+    pub fn data_dir() -> Option<PathBuf> {
+        if let Some(dir) = std::env::var_os("DOTNET_DOTNETUP_DATA_DIR").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(dir));
+        }
+        let home = crate::paths::user_home().ok()?;
+        Some(if cfg!(windows) {
+            std::env::var_os("LOCALAPPDATA")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join("AppData").join("Local"))
+                .join("dotnetup")
+        } else if cfg!(target_os = "macos") {
+            home.join("Library")
+                .join("Application Support")
+                .join("dotnetup")
+        } else {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .unwrap_or_else(|| home.join(".local").join("share"))
+                .join("dotnetup")
+        })
+    }
+
+    /// Whether `path` — a `dotnet` on PATH, a `DOTNET_ROOT` — is dotnetup's.
+    pub fn owns(path: &Path) -> bool {
+        data_dir().is_some_and(|dir| path.starts_with(&dir))
+    }
+
+    pub fn detect() -> Option<Found> {
+        let binary = crate::lookup::on_path("dotnetup");
+        let root = data_dir()
+            .map(|dir| dir.join("dotnet"))
+            .filter(|root| root.is_dir());
+        (binary.is_some() || root.is_some()).then_some(Found { binary, root })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn recognizes_paths_inside_its_data_directory() {
+            let Some(dir) = data_dir() else { return };
+            assert!(owns(&dir.join("dotnet").join("dotnet")));
+            assert!(!owns(Path::new("/usr/local/share/dotnet/dotnet")));
+        }
+    }
 }
 
 fn global_tools_check() -> Result<Option<Finding>> {
