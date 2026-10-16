@@ -10,6 +10,7 @@ mod install;
 mod installs;
 mod lock;
 mod lookup;
+mod metadata;
 mod net;
 mod paths;
 mod platform;
@@ -160,6 +161,10 @@ struct ListArgs {
     /// With --remote, include end-of-life channels and every published patch
     #[arg(long)]
     all: bool,
+    /// With --remote, check for new releases now instead of using release
+    /// metadata cached in the last few minutes
+    #[arg(long)]
+    refresh: bool,
 }
 
 #[derive(Subcommand)]
@@ -200,7 +205,7 @@ fn run() -> Result<ExitCode> {
     match cli.command {
         Command::Install { version, force } => cmd_install(version.as_deref(), force, format),
         Command::Uninstall { version } => cmd_uninstall(&version, format),
-        Command::List(args) => cmd_list(args.remote, args.all, format),
+        Command::List(args) => cmd_list(args.remote, args.all, args.refresh, format),
         Command::Pin { version } => cmd_pin(&version, format),
         Command::Default { version } => cmd_default(version.as_deref(), format),
         Command::Which { command } => cmd_which(&command, format),
@@ -358,7 +363,7 @@ fn cmd_uninstall(version: &str, format: Format) -> Result<ExitCode> {
 /// Patches per feature band shown by `dv list --remote` without `--all`.
 const REMOTE_PATCHES_PER_BAND: usize = 2;
 
-fn cmd_list(remote: bool, all: bool, format: Format) -> Result<ExitCode> {
+fn cmd_list(remote: bool, all: bool, refresh: bool, format: Format) -> Result<ExitCode> {
     let installed = installs::installed()?;
     let active = current_resolution().ok();
     let is_active = |version: &Version| {
@@ -386,7 +391,14 @@ fn cmd_list(remote: bool, all: bool, format: Format) -> Result<ExitCode> {
     });
 
     if remote {
-        return cmd_list_remote(all, format, &installed, installed_json, active_json);
+        return cmd_list_remote(
+            all,
+            refresh,
+            format,
+            &installed,
+            installed_json,
+            active_json,
+        );
     }
 
     if installed.is_empty() {
@@ -420,6 +432,7 @@ fn cmd_list(remote: bool, all: bool, format: Format) -> Result<ExitCode> {
 /// both, and two calls can disagree about a version installed in between.
 fn cmd_list_remote(
     all: bool,
+    refresh: bool,
     format: Format,
     installed: &[Version],
     installed_json: Vec<serde_json::Value>,
@@ -427,7 +440,14 @@ fn cmd_list_remote(
 ) -> Result<ExitCode> {
     let config = Config::load()?;
     let rid = platform::current()?;
-    let index = releases::fetch_index(&config.releases_url())?;
+    // Cached metadata keeps a version picker instant; it changes a few times
+    // a month, and `--refresh` is there for the moment it just did.
+    let freshness = if refresh {
+        metadata::Freshness::Revalidate
+    } else {
+        metadata::Freshness::MaxAge(metadata::LIST_MAX_AGE)
+    };
+    let index = releases::fetch_index(&config.releases_url(), freshness)?;
 
     // Supported channels, plus any channel something installed belongs to —
     // an installed SDK on an end-of-life channel is still worth showing next
@@ -445,11 +465,12 @@ fn cmd_list_remote(
     channels.sort_by_key(|channel| std::cmp::Reverse(channel.number()));
 
     let mut available: Vec<(releases::Sdk, &releases::Channel)> = Vec::new();
-    for channel in &channels {
+    let fetched = releases::fetch_channels(&channels, freshness);
+    for (channel, sdks) in channels.iter().zip(fetched) {
         // One channel whose metadata cannot be read should not hide every
         // other channel from a version picker. Installing stays strict: a
         // wrong answer there is worse than an error.
-        let sdks = match releases::fetch_channel(channel) {
+        let sdks = match sdks {
             Ok(sdks) => sdks,
             Err(err) if exit::code_for(&err) != exit::NETWORK => {
                 eprintln!("dv: skipping the {} channel: {err:#}", channel.version);
@@ -949,9 +970,11 @@ fn cmd_cache(command: CacheCommand) -> Result<ExitCode> {
             // Safe by construction: a cached archive is only ever a download
             // shortcut, and every installed tree stays where it is.
             let (removed, freed) = cache::remove(false)?;
+            // Metadata too: it is refetched on the next listing or install.
+            let (_, metadata_freed) = metadata::clear()?;
             println!(
-                "removed {removed} cached archives, freed {}",
-                net::megabytes(freed)
+                "removed {removed} cached archives and the release metadata cache, freed {}",
+                net::megabytes(freed + metadata_freed)
             );
         }
     }

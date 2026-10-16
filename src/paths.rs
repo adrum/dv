@@ -13,6 +13,7 @@
 //!   dotnet/              one install root holding everything (DOTNET_ROOT)
 //!   shims/dotnet         real files on PATH
 //!   cache/               downloaded SDK archives
+//!   cache/metadata/      Microsoft's release metadata, with HTTP validators
 //!   config.toml          default version, release index location
 //! ```
 

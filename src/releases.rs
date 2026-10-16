@@ -23,7 +23,7 @@ use serde::Deserialize;
 
 use crate::exit::{self, Failed};
 use crate::globaljson::SdkRequest;
-use crate::net;
+use crate::metadata::{self, Freshness};
 use crate::version::{Selector, Version};
 
 /// Where the channel index is published, unless `DV_RELEASES_URL` or
@@ -184,16 +184,16 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
-pub fn fetch_index(url: &str) -> Result<Index> {
-    let body = net::fetch_text(url)
+pub fn fetch_index(url: &str, freshness: Freshness) -> Result<Index> {
+    let body = metadata::fetch(url, freshness)
         .with_context(|| format!("could not fetch the .NET release index from {url}"))?;
     serde_json::from_str(&body).with_context(|| format!("the release index at {url} is not usable"))
 }
 
 /// Every SDK published in a channel, oldest first.
-pub fn fetch_channel(channel: &Channel) -> Result<Vec<Sdk>> {
+pub fn fetch_channel(channel: &Channel, freshness: Freshness) -> Result<Vec<Sdk>> {
     let url = &channel.releases_url;
-    let body = net::fetch_text(url).with_context(|| {
+    let body = metadata::fetch(url, freshness).with_context(|| {
         format!(
             "could not fetch the {} releases from {url}",
             channel.version
@@ -201,6 +201,28 @@ pub fn fetch_channel(channel: &Channel) -> Result<Vec<Sdk>> {
     })?;
     parse_channel(&channel.version, &body)
         .with_context(|| format!("the {} releases at {url} are not usable", channel.version))
+}
+
+/// Fetch several channels at once, each result in the order given.
+///
+/// Channels are independent megabyte-sized documents, so fetching them in
+/// turn makes a cold listing cost the sum of every round trip rather than
+/// the slowest one.
+pub fn fetch_channels(channels: &[&Channel], freshness: Freshness) -> Vec<Result<Vec<Sdk>>> {
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = channels
+            .iter()
+            .map(|channel| scope.spawn(move || fetch_channel(channel, freshness)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("fetching release metadata panicked")))
+            })
+            .collect()
+    })
 }
 
 fn parse_channel(channel: &str, body: &str) -> Result<Vec<Sdk>> {

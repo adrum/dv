@@ -7,6 +7,7 @@ use crate::config::Config;
 use crate::exit::{self, Failed};
 use crate::globaljson::SdkRequest;
 use crate::installs::{self, ArtifactRecord};
+use crate::metadata::Freshness;
 use crate::releases::{self, Sdk};
 use crate::version::{Selector, Version};
 use crate::{lock, net, paths, platform, roots, shims};
@@ -153,16 +154,18 @@ pub fn install(target: &Target, force: bool) -> Result<Outcome> {
 
 /// The published SDK a target names.
 fn choose(config: &Config, rid: &str, target: &Target) -> Result<Sdk> {
-    let index = releases::fetch_index(&config.releases_url())?;
+    // Installing always asks the server whether the metadata changed: a patch
+    // released minutes ago should install, and a 304 costs next to nothing.
+    let index = releases::fetch_index(&config.releases_url(), Freshness::Revalidate)?;
     let channels = match target {
         Target::Selector(selector) => releases::channels_for(&index, selector),
         Target::Request(request) => releases::channels_for_request(&index, request),
     };
 
     let mut available: Vec<Sdk> = Vec::new();
-    for channel in channels {
+    for sdks in releases::fetch_channels(&channels, Freshness::Revalidate) {
         available.extend(
-            releases::fetch_channel(channel)?
+            sdks?
                 .into_iter()
                 .filter(|sdk| sdk.archive_for(rid).is_some()),
         );

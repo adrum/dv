@@ -30,6 +30,60 @@ pub fn fetch_text(url: &str) -> Result<String> {
         .with_context(|| format!("could not read the response from {url}"))
 }
 
+/// The answer to a conditional GET.
+pub enum Conditional {
+    /// The copy the validators came from is still current.
+    NotModified,
+    /// A new body, with the validators to send next time.
+    Modified {
+        body: String,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    },
+}
+
+/// GET `url` unless it still matches `etag` / `last_modified`.
+///
+/// A 304 costs one small round trip instead of a megabyte of release
+/// metadata, which is the difference between a version picker that opens
+/// instantly and one that visibly loads.
+pub fn fetch_conditional(
+    url: &str,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> Result<Conditional> {
+    let mut request = agent().get(url);
+    if let Some(etag) = etag {
+        request = request.header("If-None-Match", etag);
+    }
+    if let Some(last_modified) = last_modified {
+        request = request.header("If-Modified-Since", last_modified);
+    }
+    let mut response = request
+        .call()
+        .map_err(|err| Failed::new(exit::NETWORK, format!("GET {url} failed: {err}")))?;
+    if response.status() == 304 {
+        return Ok(Conditional::NotModified);
+    }
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    };
+    let (etag, last_modified) = (header("etag"), header("last-modified"));
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .with_context(|| format!("could not read the response from {url}"))?;
+    Ok(Conditional::Modified {
+        body,
+        etag,
+        last_modified,
+    })
+}
+
 /// Hashes of a file, computed in one pass.
 ///
 /// Microsoft publishes sha512 for SDK archives, and dv's own releases carry a
