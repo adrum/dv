@@ -33,6 +33,7 @@ removed 10.0.402 — superseded, and nothing else needs it; `dv install <version
 | `explicit`, pinned | `dv install 10.0.402` | never |
 | `global-json` | `dv install` with no version, in a repository | as that file's `rollForward` allows |
 | `default` | `dv default 8.0` | yes, within what it names |
+| `runtime` | `dv runtime install aspnetcore@8.0` | yes, within what it names |
 
 A `global.json` requirement is re-read on every update: edit the pin and the
 next update follows it; delete the file and dv stops tracking it, and says so.

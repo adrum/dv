@@ -57,6 +57,7 @@ eval "$(dv init zsh)"   # or bash, sh, fish, powershell — add this to your she
 |---|---|
 | `dv install [version]` | install `10`, `10.0`, `10.0.4xx`, `10.0.402`, `latest` or `lts` — or, with no version, what `global.json` here asks for |
 | `dv uninstall <version>` | remove an installed SDK |
+| `dv runtime install <component@version>` | install a runtime without an SDK — `8.0`, `aspnetcore@8.0`; `uninstall` and `list` too |
 | `dv update` | install the newest SDK every tracked line and `global.json` accepts, remove what nothing needs (`--dry-run`, `--no-prune`) |
 | `dv list` | installed SDKs, active one marked |
 | `dv list --remote` | what can be installed, beside what is (`--all` for EOL channels and every patch, `--refresh` to skip the 10-minute cache, `--cached` to never touch the network) |

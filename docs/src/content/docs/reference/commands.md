@@ -26,6 +26,17 @@ fall back to previews when nothing else matches.
 Older patches stay installable by exact version whether or not the listing
 shows them. The trimming is cosmetic, because an exact pin gets committed.
 
+## Runtimes
+
+| | |
+|---|---|
+| `dv runtime install <component@version>` | install a runtime without an SDK: `8.0`, `aspnetcore@8.0`, `windowsdesktop@10` |
+| `dv runtime uninstall <component@version>` | remove one, and stop tracking it |
+| `dv runtime list` | runtimes installed on their own, and those that came with SDKs |
+| `dv runtime list --remote` | …and what can be installed (`--all` for end-of-life channels) |
+
+See [runtimes](/dv/guides/runtimes/).
+
 ## Choosing
 
 | | |
@@ -86,6 +97,7 @@ writes is plain text you can read and grep:
 ```
 ~/.local/share/dv/
   versions/10.0.402/      SDK archives, extracted exactly as published
+  runtimes/aspnetcore-8.0.12/   runtime archives, the same way
   roots/10.0.402/         install root: this SDK, every runtime (hard links)
   dotnet/                 install root holding everything — DOTNET_ROOT
   shims/dotnet            real files on PATH

@@ -40,7 +40,11 @@ a specific code exits `1`; treat `1` as "unknown", not as a stable category.
 ## JSON output
 
 `--format json` works on `install`, `uninstall`, `update`, `list`, `pin`,
-`default`, `which`, `resolve` and `doctor`.
+`default`, `which`, `resolve`, `doctor` and `runtime install|uninstall|list`.
+
+In `update` output, the `installed`, `removed` and `untracked` lists name an
+SDK by its version (`10.0.402`) and a runtime as `component@version`
+(`aspnetcore@8.0.12`).
 
 `dv update --dry-run --format json` is the cheap way to show "updates
 available": each requirement carries `current`, `target` and an `action` of

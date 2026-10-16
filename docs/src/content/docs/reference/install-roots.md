@@ -28,7 +28,8 @@ dv keeps each SDK archive extracted, untouched, in `versions/`, and composes
 install roots out of them:
 
 - **`roots/<sdk>/`** exposes **exactly one SDK**, and every host, runtime and
-  targeting pack from every installed SDK. The shim runs this root's
+  targeting pack from every installed SDK — and every runtime installed on its
+  own with `dv runtime install`, kept in `runtimes/`. The shim runs this root's
   `dotnet`, so the SDK dv resolved is the only one the host can choose — and
   any installed runtime can run what it builds.
 - **`dotnet/`** exposes everything, like a system-wide install. `DOTNET_ROOT`
