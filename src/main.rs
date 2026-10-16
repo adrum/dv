@@ -17,6 +17,7 @@ mod platform;
 mod releases;
 mod resolve;
 mod roots;
+mod runtimes;
 mod selfupdate;
 mod shims;
 mod signature;
@@ -150,6 +151,10 @@ enum Command {
         #[arg(long)]
         hook: bool,
     },
+    /// Install, remove or list runtimes without an SDK: runtime, aspnetcore,
+    /// windowsdesktop
+    #[command(subcommand)]
+    Runtime(RuntimeCommand),
     /// Rebuild the shims and install roots
     Rehash,
     /// Inspect or clear the download cache
@@ -182,6 +187,33 @@ struct ListArgs {
     /// and never touch the network
     #[arg(long)]
     cached: bool,
+}
+
+#[derive(Subcommand)]
+enum RuntimeCommand {
+    /// Install a runtime: `8.0` for the .NET runtime, `aspnetcore@8.0`,
+    /// `windowsdesktop@10`, or an exact version
+    Install {
+        /// Which runtime, as component@version
+        spec: String,
+        /// Reinstall even when the same archive is already installed
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove an installed runtime
+    Uninstall {
+        /// Which runtime, as component@version
+        spec: String,
+    },
+    /// List installed runtimes, and those that come with installed SDKs
+    List {
+        /// Also list what can be installed
+        #[arg(long)]
+        remote: bool,
+        /// With --remote, include end-of-life channels
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -233,6 +265,7 @@ fn run() -> Result<ExitCode> {
             source,
         } => cmd_resolve(pinned_only, source, format),
         Command::Init { shell, hook } => cmd_init(&shell, hook),
+        Command::Runtime(command) => cmd_runtime(command, format),
         Command::Rehash => cmd_rehash(),
         Command::Cache(command) => cmd_cache(command),
         Command::Doctor => cmd_doctor(format),
@@ -557,7 +590,7 @@ fn cmd_list_remote(
         // other channel from a version picker. Installing stays strict: a
         // wrong answer there is worse than an error.
         let sdks = match sdks {
-            Ok(sdks) => sdks,
+            Ok(data) => data.sdks,
             Err(err) if exit::code_for(&err) != exit::NETWORK => {
                 eprintln!("dv: skipping the {} channel: {err:#}", channel.version);
                 continue;
@@ -803,7 +836,26 @@ fn cmd_which(command: &str, format: Format) -> Result<ExitCode> {
 }
 
 fn cmd_run(command: &str, args: &[String]) -> Result<ExitCode> {
-    let resolution = current_resolution()?;
+    let resolution = match current_resolution() {
+        Ok(resolution) => resolution,
+        // No SDK, but runtimes: run apps through the combined root, which
+        // holds every runtime and a host. There is no SDK to choose.
+        Err(err)
+            if exit::code_for(&err) == exit::NOTHING_INSTALLED
+                && command == "dotnet"
+                && roots::host(&paths::combined_root()?).is_file() =>
+        {
+            let combined = paths::combined_root()?;
+            let mut process = std::process::Command::new(roots::host(&combined));
+            process.args(args).env("DOTNET_ROOT", &combined);
+            if let Some(arch) = platform::root_variable_arch() {
+                process.env(format!("DOTNET_ROOT_{arch}"), &combined);
+            }
+            return hand_over(process)
+                .with_context(|| format!("could not run {}", roots::host(&combined).display()));
+        }
+        Err(err) => return Err(err),
+    };
     let located = locate(&resolution.version, command)?;
     let root = installs::root(&resolution.version)?;
 
@@ -1074,7 +1126,7 @@ fn cmd_cache(command: CacheCommand) -> Result<ExitCode> {
 
 fn cmd_update(dry_run: bool, prune: bool, format: Format) -> Result<ExitCode> {
     let report = update::run(dry_run, prune)?;
-    let versions = |list: &[Version]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let versions = |list: &[update::Item]| list.iter().map(ToString::to_string).collect::<Vec<_>>();
     format.emit(
         serde_json::json!({
             "dry_run": dry_run,
@@ -1104,7 +1156,7 @@ fn cmd_update(dry_run: bool, prune: bool, format: Format) -> Result<ExitCode> {
             }
             // Line labels up, but give a long path its own line rather than
             // padding every other row out to its width.
-            const LABEL_WIDTH: usize = 12;
+            const LABEL_WIDTH: usize = 20;
             let width = report
                 .steps
                 .iter()
@@ -1160,8 +1212,8 @@ fn cmd_update(dry_run: bool, prune: bool, format: Format) -> Result<ExitCode> {
             }
             if !report.removed.is_empty() {
                 println!(
-                    "{} {} — superseded, and nothing else needs {}; `dv install <version>` \
-                     gets one back",
+                    "{} {} — superseded, and nothing else needs {}; installing by exact \
+                     version brings one back",
                     verb("removed", "would remove"),
                     versions(&report.removed).join(", "),
                     if report.removed.len() == 1 {
@@ -1173,8 +1225,8 @@ fn cmd_update(dry_run: bool, prune: bool, format: Format) -> Result<ExitCode> {
             }
             if !report.untracked.is_empty() {
                 println!(
-                    "not tracked, left alone: {} — `dv install <version>` tracks one, \
-                     `dv uninstall <version>` removes it",
+                    "not tracked, left alone: {} — installing one tracks it, uninstalling \
+                     removes it",
                     versions(&report.untracked).join(", ")
                 );
             }
@@ -1187,6 +1239,210 @@ fn cmd_update(dry_run: bool, prune: bool, format: Format) -> Result<ExitCode> {
         Some(error) => Err(error),
         None => Ok(ExitCode::SUCCESS),
     }
+}
+
+fn cmd_runtime(command: RuntimeCommand, format: Format) -> Result<ExitCode> {
+    match command {
+        RuntimeCommand::Install { spec, force } => {
+            let spec: runtimes::Spec = spec.parse()?;
+            let mut tracked = tracked::Tracked::load()?;
+            let runtime = install::choose_runtime(&spec)?;
+            let outcome = install::install_runtime(&runtime, &platform::current()?, force)?;
+            // What was asked for, so `dv update` can move it forward.
+            tracked.add(tracked::Requirement::Runtime {
+                spec: spec.to_string(),
+            });
+            tracked.save()?;
+            let path = runtimes::dir(spec.component, &outcome.version)?;
+            format.emit(
+                serde_json::json!({
+                    "component": spec.component.name(),
+                    "version": outcome.version.to_string(),
+                    "changed": outcome.changed,
+                    "path": path.display().to_string(),
+                }),
+                || {
+                    let what = spec.component.display();
+                    if outcome.changed {
+                        println!("installed {what} {}", outcome.version);
+                        println!("every install root can now run apps that need it");
+                    } else {
+                        println!(
+                            "{what} {} is already installed — add --force to reinstall it",
+                            outcome.version
+                        );
+                    }
+                },
+            )?;
+        }
+        RuntimeCommand::Uninstall { spec } => {
+            let spec: runtimes::Spec = spec.parse()?;
+            let installed = runtimes::installed()?;
+            let versions = runtimes::versions_of(&installed, spec.component);
+            let Some(version) = spec.selector.best(&versions) else {
+                return Err(exit::Failed::new(
+                    exit::NOT_INSTALLED,
+                    format!(
+                        "{} {} is not installed on its own — `dv runtime list` shows what is",
+                        spec.component.display(),
+                        spec.selector
+                    ),
+                ));
+            };
+            let target = runtimes::Installed {
+                component: spec.component,
+                version: version.clone(),
+            };
+            {
+                let _lock = lock::acquire(
+                    &runtimes::runtimes_dir()?,
+                    &format!("{}-{version}", spec.component),
+                    &format!("removing {} {version}", spec.component.display()),
+                )?;
+                runtimes::remove(&target)?;
+            }
+            roots::sync(&[])?;
+            shims::sync()?;
+            let mut tracked = tracked::Tracked::load()?;
+            tracked.forget_runtime(&spec, &version);
+            tracked.save()?;
+            format.emit(
+                serde_json::json!({
+                    "component": spec.component.name(),
+                    "version": version.to_string(),
+                    "removed": true,
+                }),
+                || println!("removed {} {version}", spec.component.display()),
+            )?;
+        }
+        RuntimeCommand::List { remote, all } => cmd_runtime_list(remote, all, format)?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Runtimes installed on their own, those that come with SDKs, and — with
+/// `--remote` — those that can be installed.
+fn cmd_runtime_list(remote: bool, all: bool, format: Format) -> Result<()> {
+    let installed = runtimes::installed()?;
+
+    // Every SDK brings the runtimes it was built with, and every root links
+    // them, so they count as available for running apps too.
+    let mut bundled: Vec<(runtimes::Component, Version, Version)> = Vec::new();
+    for sdk in installs::installed()? {
+        let tree = paths::version_dir(&sdk.to_string())?;
+        for component in runtimes::Component::ALL {
+            let dir = tree.join("shared").join(component.framework());
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                if let Some(version) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<Version>().ok())
+                {
+                    bundled.push((component, version, sdk.clone()));
+                }
+            }
+        }
+    }
+    bundled.sort();
+
+    let mut available: Vec<releases::Runtime> = Vec::new();
+    if remote {
+        let config = Config::load()?;
+        let rid = platform::current()?;
+        let index = releases::fetch_index(
+            &config.releases_url(),
+            metadata::Freshness::MaxAge(metadata::LIST_MAX_AGE),
+        )?;
+        let channels: Vec<&releases::Channel> = index
+            .channels
+            .iter()
+            .filter(|channel| all || !channel.is_eol())
+            .collect();
+        for data in releases::fetch_channels(
+            &channels,
+            metadata::Freshness::MaxAge(metadata::LIST_MAX_AGE),
+        ) {
+            available.extend(
+                data?
+                    .runtimes
+                    .into_iter()
+                    .filter(|runtime| runtime.archive_for(&rid).is_some()),
+            );
+        }
+        // Grouped by runtime, newest first within each.
+        available.sort_by(|a, b| {
+            a.component
+                .cmp(&b.component)
+                .then(b.version.cmp(&a.version))
+        });
+    }
+
+    let is_installed = |component: runtimes::Component, version: &Version| {
+        installed
+            .iter()
+            .any(|r| r.component == component && &r.version == version)
+    };
+    format.emit(
+        serde_json::json!({
+            "installed": installed.iter().map(|runtime| serde_json::json!({
+                "component": runtime.component.name(),
+                "version": runtime.version.to_string(),
+                "path": runtime.dir().ok().map(|p| p.display().to_string()),
+            })).collect::<Vec<_>>(),
+            "bundled": bundled.iter().map(|(component, version, sdk)| serde_json::json!({
+                "component": component.name(),
+                "version": version.to_string(),
+                "sdk": sdk.to_string(),
+            })).collect::<Vec<_>>(),
+            "available": available.iter().map(|runtime| serde_json::json!({
+                "component": runtime.component.name(),
+                "version": runtime.version.to_string(),
+                "installed": is_installed(runtime.component, &runtime.version),
+                "prerelease": runtime.version.is_prerelease(),
+                "channel": runtime.channel,
+                "release_date": runtime.release_date,
+            })).collect::<Vec<_>>(),
+        }),
+        || {
+            if installed.is_empty() {
+                println!("no runtimes installed on their own");
+            } else {
+                for runtime in &installed {
+                    println!("  {:<15} {}", runtime.component.name(), runtime.version);
+                }
+            }
+            if !bundled.is_empty() {
+                println!("\nwith installed SDKs, in every install root:");
+                for (component, version, sdk) in &bundled {
+                    println!("  {:<15} {version}  (SDK {sdk})", component.name());
+                }
+            }
+            if remote {
+                println!("\ninstallable:");
+                let mut seen: Vec<(runtimes::Component, String)> = Vec::new();
+                for runtime in &available {
+                    // The newest of each channel, per component, keeps this
+                    // readable; any version installs by exact version.
+                    let key = (runtime.component, runtime.channel.clone());
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    seen.push(key);
+                    let marker = if is_installed(runtime.component, &runtime.version) {
+                        "  (installed)"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "  {:<15} {}{marker}",
+                        runtime.component.name(),
+                        runtime.version
+                    );
+                }
+            }
+        },
+    )?;
+    Ok(())
 }
 
 fn cmd_rehash() -> Result<ExitCode> {

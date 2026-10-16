@@ -12,6 +12,7 @@
 //! - **global-json** — a `global.json` that `dv install` was run against,
 //!   re-read on every update so an edited pin is followed and a deleted one
 //!   is dropped
+//! - **runtime** — a runtime named to `dv runtime install`: `aspnetcore@8.0`
 //!
 //! An installed SDK that no requirement tracks is simply untracked: `dv
 //! update` never moves or removes it.
@@ -26,6 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::globaljson::{self, SdkRequest};
 use crate::paths;
+use crate::runtimes::{Component, Spec};
 use crate::version::{Selector, Version};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +38,9 @@ pub enum Requirement {
     },
     GlobalJson {
         path: PathBuf,
+    },
+    Runtime {
+        spec: String,
     },
     /// The configured default. Never stored: it comes from `config.toml`.
     #[serde(skip)]
@@ -50,6 +55,7 @@ impl Requirement {
         match self {
             Requirement::Explicit { .. } => "explicit",
             Requirement::GlobalJson { .. } => "global-json",
+            Requirement::Runtime { .. } => "runtime",
             Requirement::Default { .. } => "default",
         }
     }
@@ -68,6 +74,7 @@ impl Requirement {
                 selector.clone()
             }
             Requirement::GlobalJson { path } => path.display().to_string(),
+            Requirement::Runtime { spec } => spec.clone(),
         }
     }
 
@@ -78,6 +85,10 @@ impl Requirement {
             Requirement::Explicit { selector } | Requirement::Default { selector } => selector
                 .parse()
                 .map(Want::Selector)
+                .map_err(|err| err.to_string()),
+            Requirement::Runtime { spec } => spec
+                .parse::<Spec>()
+                .map(|spec| Want::Runtime(spec.component, spec.selector))
                 .map_err(|err| err.to_string()),
             Requirement::GlobalJson { path } => {
                 let raw =
@@ -94,7 +105,10 @@ impl Requirement {
 
     /// Whether the requirement is an exact pin, which an update never moves.
     pub fn is_pinned(&self) -> bool {
-        matches!(self.want(), Ok(Want::Selector(Selector::Exact(_))))
+        matches!(
+            self.want(),
+            Ok(Want::Selector(Selector::Exact(_)) | Want::Runtime(_, Selector::Exact(_)))
+        )
     }
 }
 
@@ -103,14 +117,24 @@ impl Requirement {
 pub enum Want {
     Selector(Selector),
     Request(SdkRequest),
+    /// A runtime: which framework, and which versions of it.
+    Runtime(Component, Selector),
 }
 
 impl Want {
+    /// The runtime this asks for, or `None` for an SDK.
+    pub fn component(&self) -> Option<Component> {
+        match self {
+            Want::Runtime(component, _) => Some(*component),
+            _ => None,
+        }
+    }
+
     /// The installed version this is satisfied by: what the `dotnet` host
     /// would pick for a `global.json`, the best match for a selector.
     pub fn satisfied_by(&self, installed: &[Version]) -> Option<Version> {
         match self {
-            Want::Selector(selector) => selector.best(installed),
+            Want::Selector(selector) | Want::Runtime(_, selector) => selector.best(installed),
             Want::Request(request) => request.select(installed),
         }
     }
@@ -119,7 +143,7 @@ impl Want {
     /// a request that allows previews does not turn every update into one.
     pub fn newest_published(&self, published: &[Version]) -> Option<Version> {
         match self {
-            Want::Selector(selector) => selector.best(published),
+            Want::Selector(selector) | Want::Runtime(_, selector) => selector.best(published),
             Want::Request(request) => {
                 let releases: Vec<&Version> =
                     published.iter().filter(|v| !v.is_prerelease()).collect();
@@ -173,6 +197,26 @@ impl Tracked {
         if !self.requirements.contains(&requirement) {
             self.requirements.push(requirement);
         }
+    }
+
+    /// Stop tracking what `dv runtime uninstall <spec>` removed: the runtime
+    /// requirement named the same way, and any exact pin on that version.
+    pub fn forget_runtime(&mut self, spec: &Spec, removed: &Version) -> Vec<Requirement> {
+        let named = spec.to_string();
+        let exact = Spec {
+            component: spec.component,
+            selector: Selector::Exact(removed.clone()),
+        }
+        .to_string();
+        let (gone, kept): (Vec<_>, Vec<_>) =
+            self.requirements
+                .drain(..)
+                .partition(|requirement| match requirement {
+                    Requirement::Runtime { spec } => *spec == named || *spec == exact,
+                    _ => false,
+                });
+        self.requirements = kept;
+        gone
     }
 
     /// Stop tracking what `dv uninstall <selector>` removed: the requirement

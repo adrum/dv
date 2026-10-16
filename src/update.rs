@@ -1,5 +1,5 @@
-//! `dv update` — move every tracked requirement to the newest SDK it accepts,
-//! then remove the SDKs it moved them away from.
+//! `dv update` — move every tracked requirement to the newest SDK or runtime
+//! it accepts, then remove what it moved them away from.
 //!
 //! Pruning is the half that needs care, so it is narrow: an update removes
 //! only an SDK it superseded — what a requirement resolved to before the
@@ -8,19 +8,73 @@
 //! no requirement tracks is never touched; the report lists it as untracked.
 //! Every removal is named, with how to get it back.
 
+use std::fmt;
+
 use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::exit::{self, Failed};
 use crate::metadata::Freshness;
 use crate::releases::{self, Sdk};
+use crate::runtimes::{self, Component};
 use crate::tracked::{Requirement, Tracked, Want};
 use crate::version::Version;
 use crate::{install, installs, lock, platform, roots, shims};
 
+/// Something an update installs or removes: an SDK, or one runtime.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Item {
+    Sdk(Version),
+    Runtime(Component, Version),
+}
+
+impl Item {
+    fn of(component: Option<Component>, version: Version) -> Self {
+        match component {
+            None => Item::Sdk(version),
+            Some(component) => Item::Runtime(component, version),
+        }
+    }
+}
+
+/// `10.0.402` for an SDK, `aspnetcore@8.0.12` for a runtime. Interface: the
+/// JSON lists use it.
+impl fmt::Display for Item {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Item::Sdk(version) => write!(f, "{version}"),
+            Item::Runtime(component, version) => write!(f, "{component}@{version}"),
+        }
+    }
+}
+
+/// SDK and runtime versions, installed or published.
+#[derive(Default)]
+struct Inventory {
+    items: Vec<Item>,
+}
+
+impl Inventory {
+    /// The versions a requirement chooses among: SDKs, or one runtime's.
+    fn versions_for(&self, component: Option<Component>) -> Vec<Version> {
+        self.items
+            .iter()
+            .filter_map(|item| match (item, component) {
+                (Item::Sdk(version), None) => Some(version.clone()),
+                (Item::Runtime(kind, version), Some(wanted)) if *kind == wanted => {
+                    Some(version.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// One requirement and what an update does for it.
 pub struct Step {
     pub requirement: Requirement,
+    /// The runtime it is about, or `None` for an SDK.
+    pub component: Option<Component>,
     /// The installed version that satisfies it before the update.
     pub current: Option<Version>,
     /// The newest published version that satisfies it.
@@ -43,12 +97,12 @@ impl Step {
 
 pub struct Report {
     pub steps: Vec<Step>,
-    /// Versions installed by this update.
-    pub installed: Vec<Version>,
-    /// Versions this update superseded and removed — or, in a dry run, would.
-    pub removed: Vec<Version>,
-    /// Installed versions no requirement resolves to, left alone.
-    pub untracked: Vec<Version>,
+    /// What this update installed — or, in a dry run, would.
+    pub installed: Vec<Item>,
+    /// What this update superseded and removed — or, in a dry run, would.
+    pub removed: Vec<Item>,
+    /// Installed SDKs and runtimes no requirement resolves to, left alone.
+    pub untracked: Vec<Item>,
     /// Requirements no longer tracked: a `global.json` deleted or unpinned.
     pub dropped: Vec<(Requirement, String)>,
 }
@@ -58,7 +112,17 @@ pub fn run(dry_run: bool, prune: bool) -> Result<Report> {
     let rid = platform::current()?;
     let mut tracked = Tracked::load()?;
     let requirements = tracked.with_default(config.default.as_deref());
-    let installed = installs::installed()?;
+    let installed = Inventory {
+        items: installs::installed()?
+            .into_iter()
+            .map(Item::Sdk)
+            .chain(
+                runtimes::installed()?
+                    .into_iter()
+                    .map(|runtime| Item::Runtime(runtime.component, runtime.version)),
+            )
+            .collect(),
+    };
 
     // Read every requirement. A global.json that went away is dropped rather
     // than failing the update: the repository moved on.
@@ -75,16 +139,28 @@ pub fn run(dry_run: bool, prune: bool) -> Result<Report> {
         }
     }
 
-    let available = published(&config, &rid, &wants)?;
-    let published: Vec<Version> = available.iter().map(|sdk| sdk.version.clone()).collect();
+    let (sdks, runtimes) = published(&config, &rid, &wants)?;
+    let available = Inventory {
+        items: sdks
+            .iter()
+            .map(|sdk| Item::Sdk(sdk.version.clone()))
+            .chain(
+                runtimes
+                    .iter()
+                    .map(|runtime| Item::Runtime(runtime.component, runtime.version.clone())),
+            )
+            .collect(),
+    };
 
     let mut steps: Vec<Step> = wants
         .iter()
         .map(|(requirement, want)| {
-            let target = want.newest_published(&published);
+            let component = want.component();
+            let target = want.newest_published(&available.versions_for(component));
             Step {
                 requirement: requirement.clone(),
-                current: want.satisfied_by(&installed),
+                component,
+                current: want.satisfied_by(&installed.versions_for(component)),
                 problem: target
                     .is_none()
                     .then(|| format!("nothing published for {rid} satisfies it")),
@@ -94,16 +170,17 @@ pub fn run(dry_run: bool, prune: bool) -> Result<Report> {
         .collect();
     steps.extend(broken.into_iter().map(|(requirement, reason)| Step {
         requirement,
+        component: None,
         current: None,
         target: None,
         problem: Some(reason),
     }));
 
-    let mut to_install: Vec<Version> = steps
+    let mut to_install: Vec<Item> = steps
         .iter()
         .filter(|step| step.action() == "install")
-        .filter_map(|step| step.target.clone())
-        .filter(|target| !installed.contains(target))
+        .filter_map(|step| step.target.clone().map(|v| Item::of(step.component, v)))
+        .filter(|item| !installed.items.contains(item))
         .collect();
     to_install.sort();
     to_install.dedup();
@@ -116,39 +193,46 @@ pub fn run(dry_run: bool, prune: bool) -> Result<Report> {
                 .retain(|requirement| !dropped.iter().any(|(gone, _)| gone == requirement));
             tracked.save()?;
         }
-        for version in &to_install {
-            let sdk = available
-                .iter()
-                .find(|sdk| &sdk.version == version)
-                .expect("targets come from this list");
-            eprintln!("  installing .NET SDK {version}");
-            install::install_sdk(sdk, &rid, false)
-                .with_context(|| format!("could not install .NET SDK {version}"))?;
-            newly_installed.push(version.clone());
+        for item in &to_install {
+            eprintln!("  installing {item}");
+            match item {
+                Item::Sdk(version) => {
+                    let sdk = sdks
+                        .iter()
+                        .find(|sdk| &sdk.version == version)
+                        .expect("targets come from this list");
+                    install::install_sdk(sdk, &rid, false)
+                }
+                Item::Runtime(component, version) => {
+                    let runtime = runtimes
+                        .iter()
+                        .find(|r| r.component == *component && &r.version == version)
+                        .expect("targets come from this list");
+                    install::install_runtime(runtime, &rid, false)
+                }
+            }
+            .with_context(|| format!("could not install {item}"))?;
+            newly_installed.push(item.clone());
         }
     }
 
     // What the machine holds once the installs are done — real after an
     // update, projected for a dry run.
-    let mut after = installed.clone();
-    for version in &to_install {
-        if !after.contains(version) {
-            after.push(version.clone());
+    let mut after = installed.items.clone();
+    for item in &to_install {
+        if !after.contains(item) {
+            after.push(item.clone());
         }
     }
     after.sort();
+    let after = Inventory { items: after };
 
     let needed = needed(&wants, &after)?;
     let removed = if prune {
         let removable = superseded(&steps, &needed);
         if !dry_run {
-            for version in &removable {
-                let _lock = lock::acquire(
-                    &crate::paths::versions_dir()?,
-                    &version.to_string(),
-                    &format!("removing .NET SDK {version}"),
-                )?;
-                installs::remove(version)?;
+            for item in &removable {
+                remove(item)?;
             }
         }
         removable
@@ -162,8 +246,9 @@ pub fn run(dry_run: bool, prune: bool) -> Result<Report> {
     }
 
     let untracked = after
+        .items
         .into_iter()
-        .filter(|version| !needed.contains(version) && !removed.contains(version))
+        .filter(|item| !needed.contains(item) && !removed.contains(item))
         .collect();
     Ok(Report {
         steps,
@@ -174,55 +259,90 @@ pub fn run(dry_run: bool, prune: bool) -> Result<Report> {
     })
 }
 
+fn remove(item: &Item) -> Result<()> {
+    match item {
+        Item::Sdk(version) => {
+            let _lock = lock::acquire(
+                &crate::paths::versions_dir()?,
+                &version.to_string(),
+                &format!("removing .NET SDK {version}"),
+            )?;
+            installs::remove(version)
+        }
+        Item::Runtime(component, version) => {
+            let _lock = lock::acquire(
+                &runtimes::runtimes_dir()?,
+                &format!("{component}-{version}"),
+                &format!("removing {} {version}", component.display()),
+            )?;
+            runtimes::remove(&runtimes::Installed {
+                component: *component,
+                version: version.clone(),
+            })
+        }
+    }
+}
+
 /// What this update supersedes: each requirement's version before the update,
 /// where the update moves it to another, unless something still needs it.
-fn superseded(steps: &[Step], needed: &[Version]) -> Vec<Version> {
-    let mut gone: Vec<Version> = steps
+fn superseded(steps: &[Step], needed: &[Item]) -> Vec<Item> {
+    let mut gone: Vec<Item> = steps
         .iter()
         .filter(|step| step.action() == "install")
-        .filter_map(|step| step.current.clone())
-        .filter(|version| !needed.contains(version))
+        .filter_map(|step| step.current.clone().map(|v| Item::of(step.component, v)))
+        .filter(|item| !needed.contains(item))
         .collect();
     gone.sort();
     gone.dedup();
     gone
 }
 
-/// Every installed version something still needs.
+/// Everything installed that something still needs.
 ///
 /// Each requirement keeps the version it resolves to — the one the `dotnet`
 /// host would choose for a `global.json`. So does whatever the current
 /// directory resolves to, which covers a repository dv was never told about
 /// at least for the one you are standing in.
-fn needed(wants: &[(Requirement, Want)], installed: &[Version]) -> Result<Vec<Version>> {
-    let mut needed: Vec<Version> = wants
+fn needed(wants: &[(Requirement, Want)], installed: &Inventory) -> Result<Vec<Item>> {
+    let mut needed: Vec<Item> = wants
         .iter()
-        .filter_map(|(_, want)| want.satisfied_by(installed))
+        .filter_map(|(_, want)| {
+            let component = want.component();
+            want.satisfied_by(&installed.versions_for(component))
+                .map(|version| Item::of(component, version))
+        })
         .collect();
     if let Ok(cwd) = std::env::current_dir()
         && let Ok(Some(file)) = crate::globaljson::nearest(&cwd)
         && let Ok(request) = file.request
         && request.is_pin()
-        && let Some(version) = request.select(installed)
+        && let Some(version) = request.select(&installed.versions_for(None))
     {
-        needed.push(version);
+        needed.push(Item::Sdk(version));
     }
     needed.sort();
     needed.dedup();
     Ok(needed)
 }
 
-/// Every SDK published for this machine in the channels the requirements can
-/// reach, fetched fresh: an update exists to notice new releases.
-fn published(config: &Config, rid: &str, wants: &[(Requirement, Want)]) -> Result<Vec<Sdk>> {
+/// Every SDK and runtime published for this machine in the channels the
+/// requirements can reach, fetched fresh: an update exists to notice new
+/// releases.
+fn published(
+    config: &Config,
+    rid: &str,
+    wants: &[(Requirement, Want)],
+) -> Result<(Vec<Sdk>, Vec<releases::Runtime>)> {
     if wants.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let index = releases::fetch_index(&config.releases_url(), Freshness::Revalidate)?;
     let mut channels: Vec<&releases::Channel> = Vec::new();
     for (_, want) in wants {
         let reachable = match want {
-            Want::Selector(selector) => releases::channels_for(&index, selector),
+            Want::Selector(selector) | Want::Runtime(_, selector) => {
+                releases::channels_for(&index, selector)
+            }
             Want::Request(request) => releases::channels_for_request(&index, request),
         };
         for channel in reachable {
@@ -232,15 +352,21 @@ fn published(config: &Config, rid: &str, wants: &[(Requirement, Want)]) -> Resul
         }
     }
 
-    let mut available = Vec::new();
-    for sdks in releases::fetch_channels(&channels, Freshness::Revalidate) {
-        available.extend(
-            sdks?
+    let (mut sdks, mut runtimes) = (Vec::new(), Vec::new());
+    for data in releases::fetch_channels(&channels, Freshness::Revalidate) {
+        let data = data?;
+        sdks.extend(
+            data.sdks
                 .into_iter()
                 .filter(|sdk| sdk.archive_for(rid).is_some()),
         );
+        runtimes.extend(
+            data.runtimes
+                .into_iter()
+                .filter(|runtime| runtime.archive_for(rid).is_some()),
+        );
     }
-    Ok(available)
+    Ok((sdks, runtimes))
 }
 
 /// The exit code a finished update leaves with: success, unless something
@@ -281,12 +407,35 @@ mod tests {
 
     #[test]
     fn each_requirement_keeps_what_it_resolves_to_and_nothing_older() {
-        let installed = [v("8.0.426"), v("10.0.401"), v("10.0.402")];
-        let wants = [want("10.0"), want("8.0.426")];
+        let installed = Inventory {
+            items: vec![
+                Item::Sdk(v("8.0.426")),
+                Item::Sdk(v("10.0.401")),
+                Item::Sdk(v("10.0.402")),
+                Item::Runtime(Component::AspNetCore, v("8.0.11")),
+                Item::Runtime(Component::AspNetCore, v("8.0.12")),
+            ],
+        };
+        let runtime = Requirement::Runtime {
+            spec: "aspnetcore@8.0".into(),
+        };
+        let wants = [
+            want("10.0"),
+            want("8.0.426"),
+            (runtime.clone(), runtime.want().unwrap()),
+        ];
         let kept = needed(&wants, &installed).unwrap();
-        assert!(kept.contains(&v("10.0.402")));
-        assert!(kept.contains(&v("8.0.426")), "an exact pin is kept");
-        assert!(!kept.contains(&v("10.0.401")), "superseded by 10.0.402");
+        assert!(kept.contains(&Item::Sdk(v("10.0.402"))));
+        assert!(
+            kept.contains(&Item::Sdk(v("8.0.426"))),
+            "an exact pin is kept"
+        );
+        assert!(
+            !kept.contains(&Item::Sdk(v("10.0.401"))),
+            "superseded by 10.0.402"
+        );
+        assert!(kept.contains(&Item::Runtime(Component::AspNetCore, v("8.0.12"))));
+        assert!(!kept.contains(&Item::Runtime(Component::AspNetCore, v("8.0.11"))));
     }
 
     #[test]
@@ -295,6 +444,7 @@ mod tests {
             requirement: Requirement::Explicit {
                 selector: selector.into(),
             },
+            component: None,
             current: current.map(v),
             target: Some(v(target)),
             problem: None,
@@ -306,8 +456,11 @@ mod tests {
             // Moved past, but another requirement still resolves to it.
             step("8.0.4xx", Some("8.0.420"), "8.0.426"),
         ];
-        let needed = [v("10.0.402"), v("9.0.310"), v("8.0.420"), v("8.0.426")];
-        assert_eq!(superseded(&steps, &needed), vec![v("10.0.401")]);
+        let needed: Vec<Item> = ["10.0.402", "9.0.310", "8.0.420", "8.0.426"]
+            .iter()
+            .map(|s| Item::Sdk(v(s)))
+            .collect();
+        assert_eq!(superseded(&steps, &needed), vec![Item::Sdk(v("10.0.401"))]);
     }
 
     #[test]
@@ -316,6 +469,7 @@ mod tests {
             requirement: Requirement::Explicit {
                 selector: "10.0".into(),
             },
+            component: None,
             current: current.map(v),
             target: target.map(v),
             problem: None,

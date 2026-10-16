@@ -101,6 +101,13 @@ pub fn sync() -> Result<Vec<String>> {
             }
         }
     }
+    // With only runtimes installed, the combined root still has a host that
+    // runs apps, and `dotnet app.dll` should reach it.
+    if !wanted.iter().any(|command| command == "dotnet")
+        && crate::roots::host(&paths::combined_root()?).is_file()
+    {
+        wanted.push("dotnet".to_string());
+    }
     wanted.sort();
 
     for command in &wanted {
