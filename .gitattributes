@@ -1,0 +1,4 @@
+# Signed fixtures: Microsoft's signature covers these exact bytes, so Git must
+# never rewrite their line endings on checkout.
+src/testdata/** -text
+src/certs/** -text
