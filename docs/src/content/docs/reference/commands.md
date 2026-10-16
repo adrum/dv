@@ -17,6 +17,7 @@ fall back to previews when nothing else matches.
 | `dv list` | installed SDKs, the active one marked with its source |
 | `dv list --remote` | what can be installed, beside what is — newest 2 per feature band |
 | `dv list --remote --all` | …including end-of-life channels and every patch |
+| `dv list --remote --refresh` | …checking for new releases now rather than using metadata cached in the last 10 minutes |
 
 Older patches stay installable by exact version whether or not the listing
 shows them. The trimming is cosmetic, because an exact pin gets committed.
@@ -60,7 +61,7 @@ on one SDK.
 |---|---|
 | `dv cache status` | what the download cache holds |
 | `dv cache prune` | remove archives no installed SDK came from |
-| `dv cache clear` | remove every cached archive |
+| `dv cache clear` | remove every cached archive, and the release metadata cache |
 | `dv self update` | replace this binary with the newest published build |
 
 ## Environment
@@ -85,5 +86,6 @@ writes is plain text you can read and grep:
   dotnet/                 install root holding everything — DOTNET_ROOT
   shims/dotnet            real files on PATH
   cache/                  downloaded archives
+  cache/metadata/         Microsoft's release metadata, cached
   config.toml             default version, release index location
 ```

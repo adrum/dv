@@ -91,6 +91,19 @@ channel something installed belongs to; `--all` adds end-of-life ones. The
 newest-two-per-band trimming applies only to the terminal listing. `dv list
 --format json` gives `installed` and `active` without touching the network.
 
+### How fresh `--remote` is
+
+Release metadata is cached locally. `dv list --remote` uses a copy younger
+than **10 minutes** without touching the network, so a picker that calls it on
+every visit opens instantly. An older copy is revalidated with a conditional
+request — one small round trip when nothing changed. `--refresh` revalidates
+now. `dv install` always revalidates, so a patch released a minute ago
+installs.
+
+When the network is unreachable, both fall back to the cached copy and say so
+on stderr; stdout is unaffected. Only a machine that has never fetched the
+metadata fails, with exit code `13`.
+
 ### The rule that makes it usable
 
 **Data on stdout, diagnostics on stderr, always.** Progress, warnings and

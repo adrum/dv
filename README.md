@@ -58,7 +58,7 @@ eval "$(dv init zsh)"   # or bash, sh, fish, powershell — add this to your she
 | `dv install [version]` | install `10`, `10.0`, `10.0.4xx`, `10.0.402`, `latest` or `lts` — or, with no version, what `global.json` here asks for |
 | `dv uninstall <version>` | remove an installed SDK |
 | `dv list` | installed SDKs, active one marked |
-| `dv list --remote` | what can be installed, beside what is (`--all` for EOL channels and every patch) |
+| `dv list --remote` | what can be installed, beside what is (`--all` for EOL channels and every patch, `--refresh` to skip the 10-minute cache) |
 | `dv pin <version>` | write `global.json` here |
 | `dv default <version>` | SDK used when nothing pins one |
 | `dv which [command]` | the binary that would run here, and nothing else |
@@ -113,7 +113,10 @@ runners and git hooks inherit `PATH` and nothing else. Each shim carries a
 
 dv has no built-in list of versions. It reads Microsoft's release metadata
 when you install or ask for `--remote`, so every SDK, preview and patch
-Microsoft publishes is installable the day it ships, with no dv update.
+Microsoft publishes is installable the day it ships, with no dv update. The
+metadata is cached: `--remote` reuses a copy from the last 10 minutes
+(`--refresh` checks now), installs always check, and both fall back to the
+cache when offline.
 
 ## Integrity
 
