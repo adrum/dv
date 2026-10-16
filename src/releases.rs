@@ -24,6 +24,7 @@ use serde::Deserialize;
 use crate::exit::{self, Failed};
 use crate::globaljson::SdkRequest;
 use crate::metadata::{self, Freshness};
+use crate::runtimes::Component;
 use crate::version::{Selector, Version};
 
 /// Where the channel index is published, unless `DV_RELEASES_URL` or
@@ -160,6 +161,52 @@ struct Release {
     sdk: Option<RawSdk>,
     #[serde(default, deserialize_with = "null_as_default")]
     sdks: Vec<RawSdk>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    runtime: Option<RawRuntime>,
+    #[serde(
+        rename = "aspnetcore-runtime",
+        default,
+        deserialize_with = "null_as_default"
+    )]
+    aspnetcore_runtime: Option<RawRuntime>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    windowsdesktop: Option<RawRuntime>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawRuntime {
+    #[serde(default, deserialize_with = "null_as_default")]
+    version: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    files: Vec<File>,
+}
+
+/// A runtime as published: one shared framework, one version.
+#[derive(Debug, Clone)]
+pub struct Runtime {
+    pub component: Component,
+    pub version: Version,
+    /// The `10.0` channel it belongs to.
+    pub channel: String,
+    pub release_date: Option<String>,
+    pub files: Vec<File>,
+}
+
+impl Runtime {
+    /// The archive for `rid`, matched by its exact published name.
+    pub fn archive_for(&self, rid: &str) -> Option<&File> {
+        let name = self.component.archive_name(rid);
+        self.files
+            .iter()
+            .find(|file| file.rid == rid && file.name == name)
+    }
+}
+
+/// Everything a channel publishes that dv installs.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelData {
+    pub sdks: Vec<Sdk>,
+    pub runtimes: Vec<Runtime>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -191,7 +238,7 @@ pub fn fetch_index(url: &str, freshness: Freshness) -> Result<Index> {
 }
 
 /// Every SDK published in a channel, oldest first.
-pub fn fetch_channel(channel: &Channel, freshness: Freshness) -> Result<Vec<Sdk>> {
+pub fn fetch_channel(channel: &Channel, freshness: Freshness) -> Result<ChannelData> {
     let url = &channel.releases_url;
     let body = metadata::fetch(url, freshness).with_context(|| {
         format!(
@@ -208,7 +255,7 @@ pub fn fetch_channel(channel: &Channel, freshness: Freshness) -> Result<Vec<Sdk>
 /// Channels are independent megabyte-sized documents, so fetching them in
 /// turn makes a cold listing cost the sum of every round trip rather than
 /// the slowest one.
-pub fn fetch_channels(channels: &[&Channel], freshness: Freshness) -> Vec<Result<Vec<Sdk>>> {
+pub fn fetch_channels(channels: &[&Channel], freshness: Freshness) -> Vec<Result<ChannelData>> {
     std::thread::scope(|scope| {
         let handles: Vec<_> = channels
             .iter()
@@ -225,10 +272,35 @@ pub fn fetch_channels(channels: &[&Channel], freshness: Freshness) -> Vec<Result
     })
 }
 
-fn parse_channel(channel: &str, body: &str) -> Result<Vec<Sdk>> {
+fn parse_channel(channel: &str, body: &str) -> Result<ChannelData> {
     let releases: ChannelReleases = serde_json::from_str(body)?;
     let mut sdks: Vec<Sdk> = Vec::new();
+    let mut runtimes: Vec<Runtime> = Vec::new();
     for release in releases.releases {
+        for (component, raw) in [
+            (Component::Runtime, &release.runtime),
+            (Component::AspNetCore, &release.aspnetcore_runtime),
+            (Component::WindowsDesktop, &release.windowsdesktop),
+        ] {
+            let Some(raw) = raw else { continue };
+            let Ok(version) = raw.version.parse::<Version>() else {
+                continue;
+            };
+            if runtimes
+                .iter()
+                .any(|runtime| runtime.component == component && runtime.version == version)
+            {
+                continue;
+            }
+            runtimes.push(Runtime {
+                component,
+                version,
+                channel: channel.to_string(),
+                release_date: release.release_date.clone(),
+                files: raw.files.clone(),
+            });
+        }
+
         // `sdks` lists every SDK a release shipped, one per feature band; the
         // older single `sdk` field is all some early releases have.
         let raw = if release.sdks.is_empty() {
@@ -253,7 +325,8 @@ fn parse_channel(channel: &str, body: &str) -> Result<Vec<Sdk>> {
         }
     }
     sdks.sort_by(|a, b| a.version.cmp(&b.version));
-    Ok(sdks)
+    runtimes.sort_by(|a, b| (a.component, &a.version).cmp(&(b.component, &b.version)));
+    Ok(ChannelData { sdks, runtimes })
 }
 
 /// The channels worth fetching to answer a selector, newest first.
@@ -340,7 +413,7 @@ mod tests {
 
     #[test]
     fn collects_every_sdk_in_every_release() {
-        let sdks = parse_channel("10.0", &channel_body()).unwrap();
+        let sdks = parse_channel("10.0", &channel_body()).unwrap().sdks;
         let versions: Vec<String> = sdks.iter().map(|sdk| sdk.version.to_string()).collect();
         assert_eq!(versions, ["10.0.113", "10.0.401", "10.0.402"]);
         assert_eq!(sdks[2].runtime_version.as_deref(), Some("10.0.13"));
@@ -349,7 +422,7 @@ mod tests {
 
     #[test]
     fn picks_the_archive_not_the_installer() {
-        let sdks = parse_channel("10.0", &channel_body()).unwrap();
+        let sdks = parse_channel("10.0", &channel_body()).unwrap().sdks;
         let newest = sdks.last().unwrap();
         let file = newest.archive_for("osx-arm64").unwrap();
         assert!(file.name.ends_with(".tar.gz"));
@@ -377,7 +450,7 @@ mod tests {
             ]}}"#,
             a = hash('a'),
         );
-        let sdks = parse_channel("3.0", &body).unwrap();
+        let sdks = parse_channel("3.0", &body).unwrap().sdks;
         assert_eq!(sdks.len(), 2);
         assert!(sdks[0].archive_for("osx-x64").is_some());
         assert!(sdks[1].files.is_empty());
